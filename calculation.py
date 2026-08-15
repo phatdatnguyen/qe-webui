@@ -10,8 +10,15 @@ from pymatgen.io.pwscf import PWInput
 from pymatgen.symmetry.bandstructure import HighSymmKpath
 from utils import get_files_in_working_directory
 
-# Default pseudopotential directory (user supplies UPF files here).
-DEFAULT_PSEUDO_DIR = os.path.expanduser("~/q-e-pseudo")
+# Root folder holding the pseudopotential sets, taken from QE's own
+# $ESPRESSO_PSEUDO when it is set (see Readme). Each immediate subdirectory is
+# one set of .UPF files (e.g. SSSP-lib-pbe-eff-v2, SG14_ONCV) and becomes a
+# choice in the "Pseudopotential Set" dropdown.
+PSEUDO_ROOT = os.environ.get("ESPRESSO_PSEUDO") or os.path.expanduser("~/q-e-pseudo")
+
+# Dropdown entry meaning "PSEUDO_ROOT itself", offered when .UPF files sit
+# directly in the root rather than in a subdirectory.
+PSEUDO_ROOT_CHOICE = "."
 
 # QE executables offered in the Run section.
 QE_EXECUTABLES = ["pw.x", "dos.x", "projwfc.x", "bands.x", "pp.x"]
@@ -191,6 +198,56 @@ def build_post_input(calc_type, prefix):
     raise Exception(f"Unknown post-processing type: {calc_type!r}")
 
 
+def _contains_upf(path):
+    try:
+        return any(f.lower().endswith(".upf") for f in os.listdir(path))
+    except OSError:
+        return False
+
+
+def list_pseudo_sets():
+    """Names of the pseudopotential sets available under PSEUDO_ROOT.
+
+    Every immediate subdirectory counts as one set; PSEUDO_ROOT itself is listed
+    first as PSEUDO_ROOT_CHOICE when it holds .UPF files directly. Returns an
+    empty list when $ESPRESSO_PSEUDO is unset/missing, which leaves the dropdown
+    empty (the user can still type a path into it).
+    """
+    if not os.path.isdir(PSEUDO_ROOT):
+        return []
+    sets = sorted(name for name in os.listdir(PSEUDO_ROOT)
+                  if os.path.isdir(os.path.join(PSEUDO_ROOT, name)))
+    if _contains_upf(PSEUDO_ROOT):
+        sets.insert(0, PSEUDO_ROOT_CHOICE)
+    return sets
+
+
+def default_pseudo_set():
+    """Initial dropdown value: the first available set, or None if there are none."""
+    sets = list_pseudo_sets()
+    return sets[0] if sets else None
+
+
+def resolve_pseudo_dir(pseudo_set):
+    """Turn a dropdown choice into the directory that holds the .UPF files.
+
+    A set name resolves under PSEUDO_ROOT; the dropdown also accepts a typed
+    absolute (or ~) path, which is used as-is so a folder outside
+    $ESPRESSO_PSEUDO still works.
+    """
+    if pseudo_set is None or not str(pseudo_set).strip():
+        raise Exception(
+            "No pseudopotential set selected. Set $ESPRESSO_PSEUDO to the folder "
+            "containing your pseudopotential sets (see the Readme) and restart "
+            "the web UI, or type a directory into the dropdown.")
+    choice = os.path.expanduser(str(pseudo_set).strip())
+    if choice == PSEUDO_ROOT_CHOICE:
+        return PSEUDO_ROOT
+    if os.path.isabs(choice):
+        return choice
+    return os.path.join(PSEUDO_ROOT, choice)
+
+
 def match_pseudopotentials(structure, pseudo_dir):
     """Map each species in the structure to a UPF file found in pseudo_dir.
 
@@ -315,8 +372,10 @@ def generate_pw_input_file(working_directory_path, calc_type, structure, pseudo_
 
     Reusable core (no Gradio). ``kgrid`` is a (kx, ky, kz) tuple (ignored for the
     crystal_b bands path); ``extras`` is a parsed {namelist: {key: value}} dict of
-    overrides (or None). Returns the written path; raises on error.
+    overrides (or None). ``pseudo_dir`` is a set name from the dropdown (resolved
+    under PSEUDO_ROOT) or an explicit path. Returns the written path; raises on error.
     """
+    pseudo_dir = resolve_pseudo_dir(pseudo_dir)
     pseudo = match_pseudopotentials(structure, pseudo_dir)
     control, system, electrons, ions, cell, kpoints_mode = _pw_sections(
         calc_type, pseudo_dir, ecutwfc, ecutrho, prefix)
@@ -371,7 +430,7 @@ def write_post_input_file(working_directory_path, calc_type, prefix, input_file_
 
 
 def on_generate_qe_input(working_directory_path, calc_type, input_structure_file_name,
-                         pseudo_dir, ecutwfc, ecutrho, kx, ky, kz, extra_settings,
+                         pseudo_set, ecutwfc, ecutrho, kx, ky, kz, extra_settings,
                          input_file_name, output_name, functional, custom_functional):
     """Gradio wrapper: validate, load structure, resolve functional, write the input."""
     try:
@@ -398,7 +457,7 @@ def on_generate_qe_input(working_directory_path, calc_type, input_structure_file
                 os.path.join(working_directory_path, input_structure_file_name))
             input_dft, is_metagga = resolve_functional(functional, custom_functional)
             extras = parse_extra_settings(extra_settings)
-            generate_pw_input_file(working_directory_path, calc_type, structure, pseudo_dir,
+            generate_pw_input_file(working_directory_path, calc_type, structure, pseudo_set,
                                    ecutwfc, ecutrho, (kx, ky, kz), input_dft, is_metagga,
                                    prefix, input_file_name, extras)
 
@@ -633,7 +692,11 @@ def calculation_tab_content(working_directory_path_state, working_directory_file
                 with gr.Column(scale=1):
                     calculation_type_dropdown = gr.Dropdown(choices=CALC_TYPES, value="scf", label="Calculation Type")
                     input_structure_file_name_dropdown = gr.Dropdown(choices=[], value=None, label="Input Structure")
-                    pseudo_dir_textbox = gr.Textbox(value=DEFAULT_PSEUDO_DIR, label="Pseudopotential Directory (contains .UPF files)")
+                    pseudo_set_dropdown = gr.Dropdown(
+                        choices=list_pseudo_sets(), value=default_pseudo_set(),
+                        label="Pseudopotential Set", allow_custom_value=True,
+                        info=f"Subfolders of $ESPRESSO_PSEUDO ({PSEUDO_ROOT}); "
+                             "you can also type a full path")
                 with gr.Column(scale=1):
                     ecutwfc_slider = gr.Slider(minimum=20, maximum=120, step=5, value=50, label="ecutwfc (Ry) — wavefunction cutoff")
                     ecutrho_slider = gr.Slider(minimum=80, maximum=960, step=20, value=400, label="ecutrho (Ry) — charge-density cutoff")
@@ -695,7 +758,7 @@ def calculation_tab_content(working_directory_path_state, working_directory_file
         generate_button.click(
             on_generate_qe_input,
             [working_directory_path_state, calculation_type_dropdown, input_structure_file_name_dropdown,
-             pseudo_dir_textbox, ecutwfc_slider, ecutrho_slider, kx_slider, ky_slider, kz_slider,
+             pseudo_set_dropdown, ecutwfc_slider, ecutrho_slider, kx_slider, ky_slider, kz_slider,
              extra_settings_textbox, input_file_name_textbox, output_name_textbox,
              functional_dropdown, custom_functional_textbox],
             [status_markdown, working_directory_file_list_state, input_file_dropdown])

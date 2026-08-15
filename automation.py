@@ -43,7 +43,7 @@ def on_file_list_change_structures(working_directory_file_list):
 # Workflow
 # --------------------------------------------------------------------------- #
 
-def on_run_workflow(working_directory_path, workflow_type, structure_file, pseudo_dir,
+def on_run_workflow(working_directory_path, workflow_type, structure_file, pseudo_set,
                     ecutwfc, ecutrho, kx, ky, kz, functional, custom_functional,
                     output_name, num_cores, qe_bin_dir):
     try:
@@ -80,7 +80,7 @@ def on_run_workflow(working_directory_path, workflow_type, structure_file, pseud
                 C.write_post_input_file(working_directory_path, calc_type, prefix, input_name)
             else:
                 C.generate_pw_input_file(
-                    working_directory_path, calc_type, structure, pseudo_dir,
+                    working_directory_path, calc_type, structure, pseudo_set,
                     ecutwfc, ecutrho, (kx, ky, kz), input_dft, is_metagga, prefix, input_name)
 
             exe, preflight_err = C.preflight_run(working_directory_path, exe_name, input_name, qe_bin_dir)
@@ -138,7 +138,7 @@ def _conv_values(param, start, stop, step):
     return values
 
 
-def on_run_convergence(working_directory_path, structure_file, pseudo_dir, ecutwfc, ecutrho,
+def on_run_convergence(working_directory_path, structure_file, pseudo_set, ecutwfc, ecutrho,
                        kx, ky, kz, functional, custom_functional, output_name,
                        num_cores, qe_bin_dir, param, start, stop, step):
     empty_df = pd.DataFrame(columns=["Value", "Total energy (eV)", "ΔE vs previous (eV)"])
@@ -186,7 +186,7 @@ def on_run_convergence(working_directory_path, structure_file, pseudo_dir, ecutw
             yield (f"<p>Convergence: {param} = {v} [{i}/{n}]...{warn}</p>", full_log, gr.update(), gr.update())
 
             C.generate_pw_input_file(
-                working_directory_path, "scf", structure, pseudo_dir,
+                working_directory_path, "scf", structure, pseudo_set,
                 this_ecutwfc, this_ecutrho, kgrid, input_dft, is_metagga, run_prefix, input_name)
 
             exe, preflight_err = C.preflight_run(working_directory_path, "pw.x", input_name, qe_bin_dir)
@@ -264,7 +264,10 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
                     wf_type = gr.Dropdown(choices=list(WORKFLOWS.keys()),
                                           value="SCF → DOS", label="Workflow")
                     wf_structure = gr.Dropdown(choices=[], value=None, label="Input Structure")
-                    wf_pseudo_dir = gr.Textbox(value=C.DEFAULT_PSEUDO_DIR, label="Pseudopotential Directory")
+                    wf_pseudo_set = gr.Dropdown(
+                        choices=C.list_pseudo_sets(), value=C.default_pseudo_set(),
+                        label="Pseudopotential Set", allow_custom_value=True,
+                        info=f"Subfolders of $ESPRESSO_PSEUDO ({C.PSEUDO_ROOT})")
                     wf_output_name = gr.Textbox(value=C.DEFAULT_PREFIX, label="Output Name (QE prefix)")
                 with gr.Column(scale=1):
                     wf_ecutwfc = gr.Slider(minimum=20, maximum=120, step=5, value=50, label="ecutwfc (Ry)")
@@ -288,7 +291,10 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
             with gr.Row():
                 with gr.Column(scale=1):
                     cv_structure = gr.Dropdown(choices=[], value=None, label="Input Structure")
-                    cv_pseudo_dir = gr.Textbox(value=C.DEFAULT_PSEUDO_DIR, label="Pseudopotential Directory")
+                    cv_pseudo_set = gr.Dropdown(
+                        choices=C.list_pseudo_sets(), value=C.default_pseudo_set(),
+                        label="Pseudopotential Set", allow_custom_value=True,
+                        info=f"Subfolders of $ESPRESSO_PSEUDO ({C.PSEUDO_ROOT})")
                     cv_output_name = gr.Textbox(value="conv", label="Output Name (QE prefix base)")
                 with gr.Column(scale=1):
                     cv_ecutwfc = gr.Slider(minimum=20, maximum=120, step=5, value=50, label="ecutwfc (Ry) — base")
@@ -323,7 +329,7 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
 
     wf_event = wf_run_button.click(
         on_run_workflow,
-        [working_directory_path_state, wf_type, wf_structure, wf_pseudo_dir,
+        [working_directory_path_state, wf_type, wf_structure, wf_pseudo_set,
          wf_ecutwfc, wf_ecutrho, wf_kx, wf_ky, wf_kz, wf_functional, wf_custom_functional,
          wf_output_name, wf_cores, wf_bin_dir],
         [status_markdown, wf_log])
@@ -333,7 +339,7 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
 
     cv_event = cv_run_button.click(
         on_run_convergence,
-        [working_directory_path_state, cv_structure, cv_pseudo_dir, cv_ecutwfc, cv_ecutrho,
+        [working_directory_path_state, cv_structure, cv_pseudo_set, cv_ecutwfc, cv_ecutrho,
          cv_kx, cv_ky, cv_kz, cv_functional, cv_custom_functional, cv_output_name,
          cv_cores, cv_bin_dir, cv_param, cv_start, cv_stop, cv_step],
         [status_markdown, cv_log, cv_plot, cv_table])
