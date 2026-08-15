@@ -28,6 +28,7 @@ pip install pymatgen
 pip install ase
 pip install nglview==4.0
 pip install gradio
+pip install git+https://github.com/Griffin-Group/pymatgen-io-espresso
 ```
 
 
