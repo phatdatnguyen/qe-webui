@@ -13,6 +13,7 @@ from pymatgen.io.espresso.inputs.pwin import PWin
 from pymatgen.electronic_structure.dos import Dos
 from pymatgen.electronic_structure.plotter import DosPlotter, BSPlotter
 from pymatgen.io.ase import AseAtomsAdaptor
+from utils import sort_by_name
 
 # Trajectory frames are subsampled to at most this many to keep the
 # generated HTML small and the viewer responsive for long relaxations.
@@ -21,6 +22,9 @@ MAX_TRAJECTORY_FRAMES = 100
 # Shared prefix/outdir used by calculation.py when generating inputs.
 PREFIX = "pwscf"
 OUTDIR = "out"
+
+# .xml files that live in the working dir but are not pw.x run outputs.
+NON_PWXML_NAMES = {"atomic_proj.xml"}
 
 
 def find_qe_xml(working_directory_path):
@@ -43,17 +47,39 @@ def find_qe_xml(working_directory_path):
 
 
 def find_xml_choices(working_directory_path):
-    """List every .xml under the working dir (relative paths) for the picker,
-    with the conventional out/pwscf.xml first."""
+    """List the pw.x .xml files under the working dir (relative paths), sorted by name.
+
+    Two kinds of .xml are filtered out so the picker only offers files PWxml can
+    read as a run: atomic_proj.xml (written by projwfc.x, different schema), and
+    <prefix>.save/data-file-schema.xml when the identical <prefix>.xml sits beside
+    it (same run reachable by two paths).
+    """
     if not working_directory_path:
         return []
     hits = glob.glob(os.path.join(working_directory_path, "**", "*.xml"), recursive=True)
-    rels = sorted(os.path.relpath(h, working_directory_path) for h in hits)
+    rels = sort_by_name(os.path.relpath(h, working_directory_path).replace(os.sep, "/")
+                        for h in hits)
+
+    choices = []
+    for rel in rels:
+        name = os.path.basename(rel)
+        if name in NON_PWXML_NAMES:
+            continue
+        save_dir = os.path.dirname(rel)
+        if name == "data-file-schema.xml" and save_dir.endswith(".save"):
+            sibling = save_dir[:-len(".save")] + ".xml"
+            if os.path.exists(os.path.join(working_directory_path, sibling)):
+                continue
+        choices.append(rel)
+    return choices
+
+
+def default_xml_choice(choices):
+    """Pick the conventional out/<PREFIX>.xml when it is present, else the first."""
     preferred = os.path.join(OUTDIR, f"{PREFIX}.xml")
-    if preferred in rels:
-        rels.remove(preferred)
-        rels.insert(0, preferred)
-    return rels
+    if preferred in choices:
+        return preferred
+    return choices[0] if choices else None
 
 
 def _prefix_from_xml(xml_path):
@@ -96,6 +122,30 @@ def parse_qe_outputs(working_directory_path, xml_rel=None):
     return bundle
 
 
+def _run_calculation_type(pwxml):
+    """The &CONTROL 'calculation' of a parsed run ('scf', 'nscf', 'bands', ...)."""
+    try:
+        return str(pwxml.parameters["control_variables"]["calculation"]).strip().lower()
+    except Exception:
+        return ""
+
+
+def _final_energy_text(pwxml, short=False):
+    """Formatted final energy, or a note when the run has none.
+
+    nscf/bands runs re-use an existing charge density and write etot = 0 to the
+    XML; printing '0.000000' there reads as a real (and wrong) energy.
+    """
+    energy = float(pwxml.final_energy)
+    if energy != 0.0:
+        return f"{energy:.6f}"
+    calc = _run_calculation_type(pwxml)
+    note = f"{calc} run" if calc else "this run"
+    if short:
+        return f"n/a ({note})"
+    return f"n/a — no total energy in the XML ({note}); see the scf run"
+
+
 def build_summary_dataframe(bundle):
     """Build a Property/Value table of key scalars, degrading per-row."""
     pwxml = bundle["pwxml"]
@@ -111,7 +161,7 @@ def build_summary_dataframe(bundle):
         except Exception:
             rows.append([label, "n/a"])
 
-    add("Final total energy (eV)", lambda: f"{pwxml.final_energy:.6f}")
+    add("Final total energy (eV)", lambda: _final_energy_text(pwxml))
 
     def band_gap():
         gap, cbm, vbm, is_direct = pwxml.eigenvalue_band_properties
@@ -206,16 +256,84 @@ def build_dos_plot(bundle, mode="element"):
         return None, f"DOS not available for this run: {exc}"
 
 
-def _find_bands_input(working_directory_path):
-    """Locate the pw.x 'bands' input (K_POINTS crystal_b) needed for k-labels."""
-    for path in glob.glob(os.path.join(working_directory_path, "*.in")):
+def _kpath_length(k_card):
+    """Number of k-points QE expands a 'crystal_b' card into, or None.
+
+    In that card the weight column is the number of points from each vertex to the
+    next, and the final vertex contributes one point of its own.
+    """
+    try:
+        weights = [int(w) for w in (k_card.weights or [])]
+    except (TypeError, ValueError):
+        return None
+    return sum(weights[:-1]) + 1 if weights else None
+
+
+def _find_bands_input(working_directory_path, nkpoints=None):
+    """Locate the pw.x 'bands' input (K_POINTS crystal_b) needed for k-labels.
+
+    Candidates are scanned in name order for determinism. When nkpoints is given,
+    an input whose k-path expands to exactly that many points wins, so the right
+    file is chosen when several bands runs live in the same directory.
+    """
+    candidates = []
+    for path in sort_by_name(glob.glob(os.path.join(working_directory_path, "*.in"))):
         try:
             with open(path) as fh:
-                if "crystal_b" in fh.read().lower():
-                    return path
+                if "crystal_b" not in fh.read().lower():
+                    continue
         except Exception:
             continue
-    return None
+        candidates.append(path)
+
+    if nkpoints is not None:
+        for path in candidates:
+            try:
+                if _kpath_length(PWin.from_file(path).k_points) == nkpoints:
+                    return path
+            except Exception:
+                continue
+    return candidates[0] if candidates else None
+
+
+def _bands_input_for(bundle, what="Band-structure plot"):
+    """Find the line-mode bands input that matches this run.
+
+    Returns (path, None) or (None, message) explaining what to do — most often
+    that the selected XML is an scf/nscf run rather than the bands run.
+    """
+    pwxml = bundle["pwxml"]
+    try:
+        nkpoints = len(pwxml.actual_kpoints)
+    except Exception:
+        nkpoints = None
+
+    path = _find_bands_input(bundle["path"], nkpoints)
+    if not path:
+        return None, (f"{what} needs the line-mode 'bands' input file "
+                      "(K_POINTS crystal_b) in this directory. Generate and run a "
+                      "'bands' calculation, then reload.")
+    try:
+        k_card = PWin.from_file(path).k_points
+    except Exception as exc:
+        return None, f"Could not read the k-path from {os.path.basename(path)}: {exc}"
+
+    # The band structure can only be built along symmetry lines if the bands
+    # input carries k-point labels. Guide the user if they are missing (older
+    # inputs generated before labels were added).
+    if not any((lbl or "").strip() for lbl in (k_card.labels or [])):
+        return None, ("The bands input has no k-point labels, so the k-path can't "
+                      "be labelled. Re-generate the 'bands' input (this version "
+                      "writes labels) and re-run it, then reload.")
+
+    expected = _kpath_length(k_card)
+    if nkpoints is not None and expected is not None and expected != nkpoints:
+        calc = _run_calculation_type(pwxml) or "pw.x"
+        return None, (f"The selected XML is a '{calc}' run with {nkpoints} k-points, but "
+                      f"the k-path in {os.path.basename(path)} has {expected}. Choose the "
+                      "XML written by the line-mode 'bands' run in 'Output File to "
+                      "Visualize'.")
+    return path, None
 
 
 def build_band_structure_plot(bundle):
@@ -224,20 +342,10 @@ def build_band_structure_plot(bundle):
     if pwxml is None:
         return None, "QE XML not available."
 
-    kpoints_filename = _find_bands_input(bundle["path"])
-    if not kpoints_filename:
-        return None, ("Band-structure plot needs the line-mode 'bands' input file "
-                      "(K_POINTS crystal_b) in this directory. Generate and run a "
-                      "'bands' calculation, then reload.")
+    kpoints_filename, err = _bands_input_for(bundle)
+    if err:
+        return None, err
     try:
-        # The band structure can only be built along symmetry lines if the bands
-        # input carries k-point labels. Guide the user if they are missing (older
-        # inputs generated before labels were added).
-        k_card = PWin.from_file(kpoints_filename).k_points
-        if not any((lbl or "").strip() for lbl in (k_card.labels or [])):
-            return None, ("The bands input has no k-point labels, so the k-path can't "
-                          "be labelled. Re-generate the 'bands' input (this version "
-                          "writes labels) and re-run it, then reload.")
         # PWxml.projected_eigenvalues (read inside get_band_structure) references
         # self.atomic_states, which only exists after a projwfc projection parse.
         # Set it to None so a plain (non-projected) band structure builds.
@@ -324,7 +432,21 @@ def build_trajectory_html(bundle):
         return None, f"Could not render trajectory: {exc}"
 
 
-def on_render_cube(working_directory_path, isolevel):
+def pick_cube_file(working_directory_path, selected_xml):
+    """Choose which .cube to render: the one named after the selected run's prefix,
+    else the first in name order. Returns None when the directory holds none."""
+    cube_files = sort_by_name(glob.glob(os.path.join(working_directory_path, "*.cube")))
+    if not cube_files:
+        return None
+    if selected_xml:
+        for_prefix = os.path.join(working_directory_path,
+                                  f"{_prefix_from_xml(selected_xml)}.cube")
+        if for_prefix in cube_files:
+            return for_prefix
+    return cube_files[0]
+
+
+def on_render_cube(working_directory_path, selected_xml, isolevel):
     """Render a Gaussian cube isosurface (produced by pp.x). Returns (html|None, message).
 
     Independent of the main Load button because parsing a volumetric grid is heavy.
@@ -332,11 +454,10 @@ def on_render_cube(working_directory_path, isolevel):
     if not working_directory_path:
         return None, "No working directory is open."
 
-    cube_files = glob.glob(os.path.join(working_directory_path, "*.cube"))
-    if not cube_files:
+    cube_path = pick_cube_file(working_directory_path, selected_xml)
+    if cube_path is None:
         return None, ("No .cube file found. Run pp.x (with output_format=6) to export "
                       "a volumetric cube first — see the Calculation tab.")
-    cube_path = cube_files[0]
 
     try:
         view = nglview.NGLWidget()
@@ -432,7 +553,7 @@ def on_compare_runs(working_directory_path, selected_xmls):
             rows.append([
                 label,
                 pw.final_structure.composition.reduced_formula,
-                f"{pw.final_energy:.6f}",
+                _final_energy_text(pw, short=True),
                 _gap(),
                 f"{pw.efermi:.3f}" if pw.efermi is not None else "n/a",
                 str(pw.run_type),
@@ -512,12 +633,11 @@ def on_render_projected_bands(working_directory_path, selected_xml):
     if not working_directory_path:
         return None, "No working directory is open."
     bundle = parse_qe_outputs(working_directory_path, selected_xml)
-    if bundle["xml_path"] is None:
+    if bundle["pwxml"] is None:
         return None, "QE XML not available."
-    kpoints_filename = _find_bands_input(working_directory_path)
-    if not kpoints_filename:
-        return None, ("Projected bands need the line-mode 'bands' input (K_POINTS "
-                      "crystal_b) in this directory.")
+    kpoints_filename, err = _bands_input_for(bundle, "Projected bands")
+    if err:
+        return None, err
 
     # projwfc.x writes the projections to <prefix>.projwfc_up only when its input
     # sets 'filproj'. Pass the path explicitly (FileGuesser doesn't check the
@@ -566,15 +686,22 @@ def on_result_file_list_change(working_directory_path):
     return (empty, None, "", None, "", None, "", None, "", hint)
 
 
-def on_refresh_result_files(working_directory_path):
-    """Repopulate the output-file picker with the .xml files in the directory."""
+def on_refresh_result_files(working_directory_path, current_xml):
+    """Repopulate the output-file picker with the .xml files in the directory.
+
+    A run rewrites the file list, so the current pick is kept whenever the file is
+    still there instead of jumping back to the first entry.
+    """
     choices = find_xml_choices(working_directory_path)
-    return gr.update(choices=choices, value=choices[0] if choices else None)
+    value = current_xml if current_xml in choices else default_xml_choice(choices)
+    return gr.update(choices=choices, value=value)
 
 
-def on_refresh_compare_files(working_directory_path):
-    """Repopulate the compare multiselect with the .xml files in the directory."""
-    return gr.update(choices=find_xml_choices(working_directory_path))
+def on_refresh_compare_files(working_directory_path, current_xmls):
+    """Repopulate the compare multiselect, keeping the picks that still exist."""
+    choices = find_xml_choices(working_directory_path)
+    kept = [x for x in (current_xmls or []) if x in choices]
+    return gr.update(choices=choices, value=kept)
 
 
 def result_tab_content(working_directory_path_state, working_directory_file_list_state, status_markdown):
@@ -634,9 +761,11 @@ def result_tab_content(working_directory_path_state, working_directory_file_list
         section_outputs + [result_hint_markdown])
     # Keep the output-file pickers in sync as files are generated/produced.
     working_directory_file_list_state.change(
-        on_refresh_result_files, [working_directory_path_state], result_file_dropdown)
+        on_refresh_result_files, [working_directory_path_state, result_file_dropdown],
+        result_file_dropdown)
     working_directory_file_list_state.change(
-        on_refresh_compare_files, [working_directory_path_state], compare_files_dropdown)
+        on_refresh_compare_files, [working_directory_path_state, compare_files_dropdown],
+        compare_files_dropdown)
 
     # Re-render just the DOS when the projection mode changes.
     dos_mode_radio.change(
@@ -648,7 +777,8 @@ def result_tab_content(working_directory_path_state, working_directory_file_list
         [proj_bands_plot, proj_bands_status_markdown])
 
     render_cube_button.click(
-        on_render_cube, [working_directory_path_state, cube_isolevel_slider],
+        on_render_cube,
+        [working_directory_path_state, result_file_dropdown, cube_isolevel_slider],
         [cube_html, cube_status_markdown])
 
     compare_button.click(

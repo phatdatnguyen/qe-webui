@@ -8,21 +8,28 @@ A Gradio + FastAPI web GUI for running [Quantum Espresso](https://www.quantum-es
 
 ## Running & environment
 
-Linux/WSL only (uses `mpirun`, `os.killpg`, POSIX process groups). The venv `qe-env/` is committed with all deps installed.
+Linux/WSL only (uses `mpirun`, `os.killpg`, POSIX process groups). The venv `qe-env/` holds all deps but is git-ignored, so a fresh clone has to recreate it (see the Readme; `pytest` is the only test-time extra).
 
 ```bash
 source qe-env/bin/activate
 python3 webui.py          # serves on 127.0.0.1, first free port from 7860
 ```
 
-There is no build step, linter config, or test suite. To smoke-test changes without QE binaries:
+There is no build step or linter config. There is a pytest suite (`tests/`, config in `pytest.ini`) — run it after any change:
 
 ```bash
-./qe-env/bin/python -m py_compile working_directory.py calculation.py result.py webui.py
-./qe-env/bin/python -c "import calculation, result, working_directory"
+./qe-env/bin/python -m pytest              # ~4 s, needs neither QE binaries nor $ESPRESSO_PSEUDO
+./qe-env/bin/python -m pytest tests/test_result.py -k bands -v
 ```
 
-Input generation and result-parsing functions can be called directly (e.g. `calculation.on_generate_qe_input(...)`, `result.on_load_results(...)`) with a temp working dir — they never raise into Gradio, so they are safe to exercise in a script.
+The suite covers `utils`, `calculation`, `automation`, `result`, `working_directory`, plus a `test_webui.py` smoke test that assembles the whole `gr.Blocks()` — that one catches event wiring mistakes (a handler whose inputs/outputs no longer line up), so keep it passing when you touch a `.click()`/`.change()`. Conventions:
+
+- Every test runs in a `tmp_path` working directory; `conftest.py` provides `working_dir`, `structure_file`/`structure` (a NaCl cell), `pseudo_root` (a fake `$ESPRESSO_PSEUDO` patched into `calculation.PSEUDO_ROOT`) and `pw_input_args`.
+- Nothing spawns a process: `run_qe_stream` is tested against a fake `subprocess.Popen`, and `shutil.which` is monkeypatched for pre-flight checks.
+- Functions that consume a parsed run take a `StubRun` (in `tests/test_result.py`) instead of a real `PWxml`, since a genuine XML needs a finished calculation.
+- Handlers must report errors rather than raise into Gradio; `gr.Warning` surfaces as a `UserWarning` in tests, so assert it with `pytest.warns`.
+
+Input generation and result-parsing functions can also be called directly (e.g. `calculation.on_generate_qe_input(...)`, `result.on_load_results(...)`) with a temp working dir.
 
 ## Architecture
 
@@ -46,6 +53,7 @@ Generated 3D viewers (nglview) are written as standalone HTML into `./static/` (
 VASP-webui generates inputs from pymatgen's curated `MP*Set` input sets. **QE has no equivalent**, so `calculation.py` generates from templates instead:
 
 - `PW_TYPES` (`scf`, `relax`, `vc-relax`, `nscf`, `bands`) → built from a `Structure` via `pymatgen.io.pwscf.PWInput`. The `bands` type uses `HighSymmKpath` to emit a `K_POINTS crystal_b` line-mode path.
+- **The `bands` cell is checked, not converted.** QE reads `crystal_b` coordinates in the basis of the cell written to the input, while `HighSymmKpath` expresses its high-symmetry points in the *standard primitive* basis — for a conventional cell or a supercell the two differ and every coordinate and label would silently describe a different point (for conventional NaCl, X lands 40° off and at the wrong |k|). `ensure_bands_cell()` therefore raises unless `is_standard_primitive()` holds; it is called from `build_kpath_crystal_b()` (the choke point for both tabs) and up front in `on_run_workflow()` so a bands workflow fails before the scf stage rather than after it. The cell is never converted silently, because a bands run must use the same cell as the scf run whose charge density it reads: instead `on_save_primitive_cell()` (the "Save Primitive Cell" button, present in both tabs) writes `<stem>_primitive.cif` and selects it, so the same file feeds every stage. Note `primitive_standard_structure()` must pass `international_monoclinic=False` to match what `KPathSetyawanCurtarolo` asks for.
 - `POST_TYPES` (`dos`, `projwfc`, `bands.x`, `pp.x`) → written from plain-text namelist templates via `build_post_input()`.
 - The QE `prefix` (labelled "Output Name" in the UI) is **user-chosen at generation time** (default `pwscf`), written into each input's `&CONTROL`. The input file name and the run log name track the calculation type (`scf` → `scf.in` / `scf.out`); the prefix does not. `CALC_EXECUTABLE` maps each type to its binary so picking `dos` selects `dos.x`.
 - Pseudopotentials live under `PSEUDO_ROOT` = `$ESPRESSO_PSEUDO` (falling back to `~/q-e-pseudo`), whose immediate subdirectories are the selectable *sets*. `list_pseudo_sets()` fills the "Pseudopotential Set" dropdown at UI-build time (so a new set needs an app restart), and `resolve_pseudo_dir()` — called once at the top of `generate_pw_input_file()`, the single choke point for both `calculation.py` and `automation.py` — turns the chosen set name into the directory written as `pseudo_dir`. The dropdowns are `allow_custom_value=True`, so a typed absolute path is passed through as-is. Within the set, a UPF is auto-matched per element by comparing the element symbol to the UPF filename stem.

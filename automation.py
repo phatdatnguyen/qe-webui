@@ -28,15 +28,23 @@ WORKFLOWS = {
 MAX_CONV_POINTS = 20
 
 
-def on_file_list_change_structures(working_directory_file_list):
-    """Refresh both structure dropdowns when the working-dir file list changes."""
+def on_file_list_change_structures(wf_current, cv_current, working_directory_file_list):
+    """Refresh both structure dropdowns when the working-dir file list changes.
+
+    Each dropdown keeps its current selection when that file still exists (a run
+    refreshes the list, and re-selecting the first structure would be surprising);
+    otherwise it falls back to the first structure. The list arrives sorted by name.
+    """
     files = working_directory_file_list or []
     structure_files = [f for f in files
                        if f.endswith((".cif", ".vasp", "POSCAR", "CONTCAR"))]
-    update = gr.update(choices=structure_files,
-                       value=structure_files[0] if structure_files else None)
-    return update, gr.update(choices=structure_files,
-                             value=structure_files[0] if structure_files else None)
+    fallback = structure_files[0] if structure_files else None
+
+    def _update(current):
+        value = current if current in structure_files else fallback
+        return gr.update(choices=structure_files, value=value)
+
+    return _update(wf_current), _update(cv_current)
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +74,11 @@ def on_run_workflow(working_directory_path, workflow_type, structure_file, pseud
 
         structure = Structure.from_file(os.path.join(working_directory_path, structure_file))
         input_dft, is_metagga = C.resolve_functional(functional, custom_functional)
+
+        # A bands stage can only be labelled in the standard primitive cell; check
+        # before the first stage runs rather than after an scf has already finished.
+        if any(calc_type == "bands" for calc_type, _exe in stages):
+            C.ensure_bands_cell(structure)
 
         full_log = ""
         n = len(stages)
@@ -264,6 +277,8 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
                     wf_type = gr.Dropdown(choices=list(WORKFLOWS.keys()),
                                           value="SCF → DOS", label="Workflow")
                     wf_structure = gr.Dropdown(choices=[], value=None, label="Input Structure")
+                    # The band-structure workflow needs the primitive cell.
+                    wf_save_primitive = gr.Button("Save Primitive Cell", size="sm")
                     wf_pseudo_set = gr.Dropdown(
                         choices=C.list_pseudo_sets(), value=C.default_pseudo_set(),
                         label="Pseudopotential Set", allow_custom_value=True,
@@ -324,8 +339,13 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
 
     # Keep both structure dropdowns in sync with the working-dir file list.
     working_directory_file_list_state.change(
-        on_file_list_change_structures, [working_directory_file_list_state],
+        on_file_list_change_structures,
+        [wf_structure, cv_structure, working_directory_file_list_state],
         [wf_structure, cv_structure])
+
+    wf_save_primitive.click(
+        C.on_save_primitive_cell, [working_directory_path_state, wf_structure],
+        [status_markdown, working_directory_file_list_state, wf_structure])
 
     wf_event = wf_run_button.click(
         on_run_workflow,

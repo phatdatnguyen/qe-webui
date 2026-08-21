@@ -8,7 +8,8 @@
       "PowerShell(wsl.exe -d Ubuntu -- bash -lc 'which pw.x; ls -la /home/datnguyen/quantum-espresso 2>/dev/null | head -30; echo ---PSEUDO---; ls /home/datnguyen/quantum-espresso/q-e-pseudo/ONCV 2>/dev/null | head -20')",
       "Bash(wsl.exe *)",
       "PowerShell(wsl.exe -d Ubuntu bash /tmp/verify_libxc.sh)",
-      "PowerShell(wsl.exe -d Ubuntu bash /tmp/diag_libxc.sh)"
+      "PowerShell(wsl.exe -d Ubuntu bash /tmp/diag_libxc.sh)",
+      "Bash(wsl *)"
     ]
   }
 }

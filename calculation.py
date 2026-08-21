@@ -4,11 +4,13 @@ import shlex
 import shutil
 import signal
 import subprocess
+import warnings
 import gradio as gr
 from pymatgen.core import Structure
 from pymatgen.io.pwscf import PWInput
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pymatgen.symmetry.bandstructure import HighSymmKpath
-from utils import get_files_in_working_directory
+from utils import get_files_in_working_directory, sort_by_name, validate_name
 
 # Root folder holding the pseudopotential sets, taken from QE's own
 # $ESPRESSO_PSEUDO when it is set (see Readme). Each immediate subdirectory is
@@ -77,9 +79,6 @@ FUNCTIONALS = {
 # input_dft values that are meta-GGA; used to apply an SCF-friendly mixing_beta.
 META_GGA = {"scan", "tpss", "m06l"}
 
-# Characters not allowed in a file name / prefix.
-_INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
 # Handle to the currently running QE process, so the Stop button can reach it.
 _current_process = None
 
@@ -106,17 +105,6 @@ def resolve_functional(choice, custom_text):
     low = value.lower()
     is_metagga = low in META_GGA or "scan" in low or "mgga" in low
     return value, is_metagga
-
-
-def validate_name(name, kind):
-    """Return an error string if name is empty/has invalid characters, else None."""
-    name = (name or "").strip()
-    if not name:
-        return f"Please provide a {kind}."
-    if _INVALID_NAME.search(name) or name in (".", ".."):
-        return (f"The {kind} {name!r} contains invalid characters "
-                "(avoid / \\ : * ? \" < > | and control characters).")
-    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -215,8 +203,8 @@ def list_pseudo_sets():
     """
     if not os.path.isdir(PSEUDO_ROOT):
         return []
-    sets = sorted(name for name in os.listdir(PSEUDO_ROOT)
-                  if os.path.isdir(os.path.join(PSEUDO_ROOT, name)))
+    sets = sort_by_name(name for name in os.listdir(PSEUDO_ROOT)
+                        if os.path.isdir(os.path.join(PSEUDO_ROOT, name)))
     if _contains_upf(PSEUDO_ROOT):
         sets.insert(0, PSEUDO_ROOT_CHOICE)
     return sets
@@ -283,6 +271,60 @@ def match_pseudopotentials(structure, pseudo_dir):
     return pseudo
 
 
+def primitive_standard_structure(structure):
+    """The standard primitive cell (the setting HighSymmKpath labels k-points in).
+
+    ``international_monoclinic=False`` matches what KPathSetyawanCurtarolo asks for;
+    with the default (True) a monoclinic cell would come back in a setting the
+    band-structure check then rejects.
+    """
+    return SpacegroupAnalyzer(structure).get_primitive_standard_structure(
+        international_monoclinic=False)
+
+
+def _same_cell(lattice, other, tol=1e-3):
+    """Whether two lattices have the same lengths and angles.
+
+    A pure rotation between them is harmless — fractional coordinates, and so the
+    k-path, are unchanged — which is why the metric is compared and not the matrix.
+    """
+    return all(abs(a - b) <= tol * max(1.0, abs(a))
+               for a, b in zip(lattice.parameters, other.parameters))
+
+
+def is_standard_primitive(structure, primitive=None):
+    """Whether ``structure`` already is its own standard primitive cell."""
+    if primitive is None:
+        primitive = primitive_standard_structure(structure)
+    return (len(structure) == len(primitive)
+            and _same_cell(structure.lattice, primitive.lattice))
+
+
+def ensure_bands_cell(structure):
+    """Raise unless a labelled k-path can be written for ``structure`` as-is.
+
+    QE reads ``K_POINTS crystal_b`` coordinates in the basis of the cell written to
+    the input file, while HighSymmKpath expresses its high-symmetry points in the
+    standard primitive basis. For any other cell — a conventional cell, a supercell —
+    the two bases differ, so every coordinate and label would silently point at a
+    different place in reciprocal space. Returns the HighSymmKpath for reuse.
+    """
+    with warnings.catch_warnings():
+        # HighSymmKpath warns about a non-primitive cell; we raise a better error.
+        warnings.simplefilter("ignore")
+        high_symm = HighSymmKpath(structure)
+
+    if not is_standard_primitive(structure, high_symm.prim):
+        raise Exception(
+            f"The selected structure is not the standard primitive cell "
+            f"({len(structure)} sites; the primitive cell has {len(high_symm.prim)}), "
+            "so the k-path labels would describe a different cell and the band "
+            "structure would be wrong. Click 'Save Primitive Cell' to write a "
+            "primitive .cif, then select that file for both the scf and the "
+            "bands run.")
+    return high_symm
+
+
 def build_kpath_crystal_b(structure, npoints=20):
     """Build a labelled K_POINTS crystal_b path from the structure's high-symmetry
     path. Returns a list of (kx, ky, kz, count, label).
@@ -292,8 +334,10 @@ def build_kpath_crystal_b(structure, npoints=20):
     marker (one point, no interpolation to the next branch — pymatgen-io-espresso
     reads it as a break), and for the final vertex QE ignores the count anyway.
     ``label`` is the high-symmetry point name — required for the band-structure plot.
+
+    Raises for a cell the path cannot be labelled in — see ensure_bands_cell().
     """
-    kpath = HighSymmKpath(structure).kpath
+    kpath = ensure_bands_cell(structure).kpath
     kpoints = kpath["kpoints"]
 
     out = []
@@ -476,6 +520,56 @@ def on_generate_qe_input(working_directory_path, calc_type, input_structure_file
                 gr.update())
 
 
+def primitive_cif_name(structure_file_name):
+    """Name of the .cif holding the primitive cell of a structure file."""
+    stem = os.path.splitext(os.path.basename(structure_file_name))[0]
+    return f"{stem}_primitive.cif"
+
+
+def _structure_files(files):
+    return [f for f in files if f.endswith((".cif", ".vasp", "POSCAR", "CONTCAR"))]
+
+
+def on_save_primitive_cell(working_directory_path, structure_file_name):
+    """Write the standard primitive cell of the selected structure as a new .cif.
+
+    A 'bands' run can only be labelled in that cell (see ensure_bands_cell), and the
+    bands run has to use the same cell as the scf run whose charge density it reads —
+    so the conversion is done once, to a file, and the new file is selected here for
+    the whole chain rather than applied silently per input.
+    """
+    try:
+        if not working_directory_path:
+            raise Exception("No working directory is open.")
+        if not structure_file_name:
+            raise Exception("Please select an input structure file.")
+
+        structure = Structure.from_file(
+            os.path.join(working_directory_path, structure_file_name))
+        primitive = primitive_standard_structure(structure)
+
+        if is_standard_primitive(structure, primitive):
+            return (f"<p>'{structure_file_name}' is already the standard primitive "
+                    f"cell ({len(structure)} sites) — it can be used for a bands "
+                    "run as-is.</p>",
+                    get_files_in_working_directory(working_directory_path),
+                    gr.update())
+
+        cif_name = primitive_cif_name(structure_file_name)
+        primitive.to(filename=os.path.join(working_directory_path, cif_name))
+        files = get_files_in_working_directory(working_directory_path)
+        return (f"<p style='color:green'>Saved {cif_name} "
+                f"({len(structure)} → {len(primitive)} sites). Use it for both the "
+                "scf and the bands run so their cells match.</p>",
+                files,
+                gr.update(choices=_structure_files(files), value=cif_name))
+
+    except Exception as e:
+        return (f"<p style='color:red'>Could not save the primitive cell: {e}</p>",
+                get_files_in_working_directory(working_directory_path),
+                gr.update())
+
+
 def on_select_calculation_type(calc_type):
     """Toggle inputs and fill default file names when the calculation type changes.
 
@@ -494,21 +588,22 @@ def on_select_calculation_type(calc_type):
             gr.update(value=default_output_name(input_name)))    # output (log) file name
 
 
-def on_working_directory_file_list_change(current_input_file, working_directory_file_list):
+def on_working_directory_file_list_change(current_structure_file, current_input_file,
+                                          working_directory_file_list):
     """Refresh the structure dropdown and the run input-file dropdown.
 
-    The run-input selection is preserved when it still exists (so a refresh after
-    a run, or a generate that already selected a file, isn't clobbered); otherwise
-    it defaults to the first input file.
+    Both selections are preserved when they still exist (so a refresh after a run,
+    or a generate that already selected a file, isn't clobbered); otherwise they
+    fall back to the first matching file. The file list arrives sorted by name.
     """
     files = working_directory_file_list or []
-    structure_files = [f for f in files
-                       if f.endswith((".cif", ".vasp", "POSCAR", "CONTCAR"))]
+    structure_files = _structure_files(files)
     input_files = [f for f in files if f.endswith((".in", ".pwi"))]
+    structure_value = (current_structure_file if current_structure_file in structure_files
+                       else (structure_files[0] if structure_files else None))
     input_value = (current_input_file if current_input_file in input_files
                    else (input_files[0] if input_files else None))
-    return (gr.update(choices=structure_files,
-                      value=structure_files[0] if structure_files else None),
+    return (gr.update(choices=structure_files, value=structure_value),
             gr.update(choices=input_files, value=input_value))
 
 
@@ -692,6 +787,8 @@ def calculation_tab_content(working_directory_path_state, working_directory_file
                 with gr.Column(scale=1):
                     calculation_type_dropdown = gr.Dropdown(choices=CALC_TYPES, value="scf", label="Calculation Type")
                     input_structure_file_name_dropdown = gr.Dropdown(choices=[], value=None, label="Input Structure")
+                    # A 'bands' k-path can only be labelled in the primitive cell.
+                    save_primitive_button = gr.Button("Save Primitive Cell", size="sm")
                     pseudo_set_dropdown = gr.Dropdown(
                         choices=list_pseudo_sets(), value=default_pseudo_set(),
                         label="Pseudopotential Set", allow_custom_value=True,
@@ -745,7 +842,8 @@ def calculation_tab_content(working_directory_path_state, working_directory_file
 
         working_directory_file_list_state.change(
             on_working_directory_file_list_change,
-            [input_file_dropdown, working_directory_file_list_state],
+            [input_structure_file_name_dropdown, input_file_dropdown,
+             working_directory_file_list_state],
             [input_structure_file_name_dropdown, input_file_dropdown])
 
         calculation_type_dropdown.change(
@@ -754,6 +852,12 @@ def calculation_tab_content(working_directory_path_state, working_directory_file
              qe_executable_dropdown, input_file_name_textbox, output_file_textbox])
 
         input_file_dropdown.change(on_select_input_file, input_file_dropdown, output_file_textbox)
+
+        save_primitive_button.click(
+            on_save_primitive_cell,
+            [working_directory_path_state, input_structure_file_name_dropdown],
+            [status_markdown, working_directory_file_list_state,
+             input_structure_file_name_dropdown])
 
         generate_button.click(
             on_generate_qe_input,

@@ -5,7 +5,7 @@ import pandas as pd
 import gradio as gr
 from pymatgen.core import Structure
 import nglview
-from utils import get_files_in_working_directory
+from utils import get_files_in_working_directory, sort_by_name, validate_name
 
 # File suffixes the structure viewer can load directly with pymatgen.
 STRUCTURE_SUFFIXES = ('.cif', '.vasp', 'POSCAR', 'CONTCAR')
@@ -16,14 +16,25 @@ TEXT_SUFFIXES = ('.in', '.pwi', '.out', '.dos', '.txt', '.cif', '.log')
 def get_working_directories():
     base_path = "./data/"
     os.makedirs(base_path, exist_ok=True)
-    return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    return sort_by_name([d for d in os.listdir(base_path)
+                         if os.path.isdir(os.path.join(base_path, d))])
+
+
+def default_working_directory():
+    """Pre-select the first existing working directory (None when there are none)."""
+    directories = get_working_directories()
+    return directories[0] if directories else None
 
 
 def on_open_working_directory(working_directory):
-    if working_directory is None or working_directory.strip() == "":
-        gr.Warning("Please specify a working directory.")
+    # The name is joined onto ./data/, so reject anything with a path separator
+    # (a typed '../x' would otherwise create a directory outside ./data).
+    error = validate_name(working_directory, "working directory name")
+    if error:
+        gr.Warning(error)
         return gr.update(), None, None, gr.update()
 
+    working_directory = working_directory.strip()
     working_directory_path = os.path.join("./data/", working_directory)
     os.makedirs(working_directory_path, exist_ok=True)
     files = get_files_in_working_directory(working_directory_path)
@@ -63,7 +74,10 @@ def on_file_list_change(working_directory_path):
     for f in files:
         file_type = _classify_file(f)
         file_path = os.path.join(working_directory_path, f)
-        modified_time = os.path.getmtime(file_path)
+        try:
+            modified_time = os.path.getmtime(file_path)
+        except OSError:
+            continue  # removed/replaced by a running calculation between listing and stat
         file_info.append([f, file_type, modified_time])
     file_info.sort(key=lambda x: x[2], reverse=True)
     for entry in file_info:
@@ -96,7 +110,11 @@ def on_selected_text_file_state_change(state):
 
 
 def on_upload_file(working_directory_path, file_path):
-    shutil.copy2(file_path, os.path.join(working_directory_path, os.path.basename(file_path)))
+    try:
+        shutil.copy2(file_path, os.path.join(working_directory_path,
+                                             os.path.basename(file_path)))
+    except Exception as exc:
+        gr.Warning("Error uploading file!\n" + str(exc))
     return get_files_in_working_directory(working_directory_path)
 
 
@@ -149,6 +167,10 @@ def on_view_structure_file(working_directory_path, file_name, x, y, z):
 
 
 def on_view_text_file(working_directory_path, text_file_name):
+    if not text_file_name:
+        gr.Warning("Please select a text file to view.")
+        return gr.update(), gr.update()
+
     text_file_path = os.path.join(working_directory_path, text_file_name)
     try:
         with open(text_file_path, 'r') as file:
@@ -178,7 +200,7 @@ def on_save_text_file(working_directory_path, text_file_name, text_content):
 
 def working_directory_blocks():
     with gr.Column(scale=1):
-        working_directory_dropdown = gr.Dropdown(label="Working Directory", choices=get_working_directories(), value="wd", allow_custom_value=True)
+        working_directory_dropdown = gr.Dropdown(label="Working Directory", choices=get_working_directories(), value=default_working_directory(), allow_custom_value=True)
         working_directory_path_state = gr.State()
         open_working_directory_button = gr.Button(value="Create/Open Working Directory")
         working_directory_file_list_state = gr.State()

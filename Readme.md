@@ -82,3 +82,14 @@ To start the web UI:
 source qe-env/bin/activate
 python3 webui.py
 ```
+
+
+## Tests
+
+The test suite needs no Quantum Espresso installation, no pseudopotentials and no
+network — every case runs against a temporary working directory:
+
+```
+pip install pytest
+python3 -m pytest
+```

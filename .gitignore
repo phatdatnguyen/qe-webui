@@ -4,6 +4,7 @@ data/
 static/
 __pycache__/
 .vs/
+.claude/worktrees/
 
 # Python packaging / build artifacts
 build/
