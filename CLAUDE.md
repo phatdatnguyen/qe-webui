@@ -20,7 +20,20 @@ There is no build step or linter config. There is a pytest suite (`tests/`, conf
 ```bash
 ./qe-env/bin/python -m pytest              # ~4 s, needs neither QE binaries nor $ESPRESSO_PSEUDO
 ./qe-env/bin/python -m pytest tests/test_result.py -k bands -v
+./qe-env/bin/python -m pytest -m qe        # ~55 s, really runs pw.x/dos.x (see below)
+./qe-env/bin/python -m pytest -m ""        # everything
 ```
+
+`tests/test_qe_integration.py` is the only module that runs QE. It is marked `qe`
+and deselected by default (`addopts` in `pytest.ini`), and skips itself unless
+`pw.x`/`dos.x`/`mpirun` are on PATH and `$ESPRESSO_PSEUDO` holds a set covering
+silicon — so run it from the same shell you would start the web UI from. It drives
+the app's own functions (`generate_pw_input_file` → `preflight_run` →
+`run_qe_stream` → `result.*`) through scf, bands, nscf+dos.x and relax on a 2-atom
+Si cell, which is the only way to catch an input QE rejects or a result helper that
+disagrees with a genuine XML. Its band test asserts silicon's VBM lands on Γ and its
+CBM ~85% of the way to X — the end-to-end check that the `crystal_b` path is written
+in the right basis.
 
 The suite covers `utils`, `calculation`, `automation`, `result`, `working_directory`, plus a `test_webui.py` smoke test that assembles the whole `gr.Blocks()` — that one catches event wiring mistakes (a handler whose inputs/outputs no longer line up), so keep it passing when you touch a `.click()`/`.change()`. Conventions:
 
@@ -61,5 +74,7 @@ VASP-webui generates inputs from pymatgen's curated `MP*Set` input sets. **QE ha
 - Runs are `mpirun -np N <exe> -in <file>` streamed live (the interpolated exe/input names are `shlex.quote`-d); the user picks which `.in` file and which binary to run.
 
 `result.py` parses QE output with `pymatgen.io.espresso.outputs.PWxml`, which subclasses pymatgen's `Vasprun` and is a near drop-in — so the VASP result logic (summary table, `DosPlotter`/`BSPlotter`, trajectory, convergence) carries over. DOS needs a `dos.x`/`projwfc.x` run; band-structure plots need a line-mode `bands` run plus its `.in` file (parsed for k-labels).
+
+**One inherited behaviour is deliberately not reused: `eigenvalue_band_properties`.** It calls any state with occupancy above `occu_tol` (1e-8) occupied, and since every input this app writes uses `occupations = 'smearing'` with `degauss = 0.01` Ry, conduction states carry small non-zero occupancies — so the "VBM" walks up into the conduction band and the gap collapses (silicon: 0.018 eV reported for a real 0.454 eV gap; it also mislabels NaCl's direct gap as indirect). `band_edges()` instead counts filled bands from the *sum* of the occupancies at each k-point, which smearing conserves, then takes VBM/CBM from those band indices and reports metallic when they overlap. `_band_gap_text()` formats it for both the Summary table and the Compare table. Don't swap it back for the one-liner.
 
 **Cross-module coupling to watch:** `OUTDIR` (`./out`) is shared between `calculation.py` and `result.py`. The prefix is *not* hard-coded — generation bakes the user's choice into `&CONTROL`, and the Result tab lists the `out/*.xml` files, letting the user pick one; `result.py::_prefix_from_xml` then infers that file's prefix and uses it to locate the matching `<prefix>.dos` / `.pdos_*` / `.cube`. So a run's XML, log, and auxiliary files all line up only if the same prefix (Output Name) is used for the pw.x run and its post-processing steps.

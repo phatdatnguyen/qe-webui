@@ -146,6 +146,64 @@ def _final_energy_text(pwxml, short=False):
     return f"n/a — no total energy in the XML ({note}); see the scf run"
 
 
+def band_edges(pwxml):
+    """Locate the band edges of a parsed run. Returns (vbm, cbm, is_direct) in eV,
+    or None when the run cannot answer (no eigenvalues, or no empty band above the
+    occupied ones).
+
+    The occupied-band count is taken from the *sum* of the occupancies at each
+    k-point — a quantity smearing conserves — rather than from a per-state
+    occupancy threshold. That threshold is what makes pymatgen's inherited
+    ``eigenvalue_band_properties`` unusable here: every input this app generates
+    sets ``occupations = 'smearing'``, so conduction states carry small non-zero
+    occupancies, get counted as occupied, and the gap of a small-gap semiconductor
+    collapses (silicon: 0.018 eV reported for a real 0.454 eV gap).
+    """
+    eigenvalues = getattr(pwxml, "eigenvalues", None)
+    if not eigenvalues:
+        return None
+
+    vbm, cbm, vbm_k, cbm_k = -np.inf, np.inf, None, None
+    for values in eigenvalues.values():
+        energies, occupancies = values[:, :, 0], values[:, :, 1]
+        # Per spin channel each band holds one electron, so the occupancies at a
+        # k-point sum to the number of filled bands there.
+        n_occupied = int(round(float(occupancies.sum(axis=1).mean())))
+        if not 0 < n_occupied < energies.shape[1]:
+            return None
+
+        highest_filled, lowest_empty = energies[:, n_occupied - 1], energies[:, n_occupied]
+        if highest_filled.max() > vbm:
+            vbm, vbm_k = float(highest_filled.max()), int(highest_filled.argmax())
+        if lowest_empty.min() < cbm:
+            cbm, cbm_k = float(lowest_empty.min()), int(lowest_empty.argmin())
+
+    kpoints = getattr(pwxml, "actual_kpoints", None)
+    if kpoints is not None and max(vbm_k, cbm_k) < len(kpoints):
+        is_direct = bool(np.allclose(kpoints[vbm_k], kpoints[cbm_k], atol=1e-6))
+    else:
+        is_direct = vbm_k == cbm_k
+    return vbm, cbm, is_direct
+
+
+# Gaps below this are reported as metallic rather than as a number.
+GAP_TOL = 0.01
+
+
+def _band_gap_text(pwxml, short=False):
+    """Formatted band gap, or a note when the run cannot answer."""
+    edges = band_edges(pwxml)
+    if edges is None:
+        return "n/a"
+    vbm, cbm, is_direct = edges
+    gap = cbm - vbm
+    if gap <= GAP_TOL:
+        return "Metallic" if short else "Metallic (no gap)"
+    if short:
+        return f"{gap:.3f} eV ({'d' if is_direct else 'i'})"
+    return f"{gap:.3f} eV ({'direct' if is_direct else 'indirect'})"
+
+
 def build_summary_dataframe(bundle):
     """Build a Property/Value table of key scalars, degrading per-row."""
     pwxml = bundle["pwxml"]
@@ -163,12 +221,7 @@ def build_summary_dataframe(bundle):
 
     add("Final total energy (eV)", lambda: _final_energy_text(pwxml))
 
-    def band_gap():
-        gap, cbm, vbm, is_direct = pwxml.eigenvalue_band_properties
-        if gap is None or gap <= 0.01:
-            return "Metallic (no gap)"
-        return f"{gap:.3f} eV ({'direct' if is_direct else 'indirect'})"
-    add("Band gap", band_gap)
+    add("Band gap", lambda: _band_gap_text(pwxml))
 
     add("Fermi level", lambda: f"{pwxml.efermi:.4f} eV" if pwxml.efermi is not None else "n/a")
     add("Converged (electronic)", lambda: str(pwxml.converged_electronic))
@@ -546,15 +599,11 @@ def on_compare_runs(working_directory_path, selected_xmls):
                 rows.append([label, "n/a", "unreadable", "n/a", "n/a", "n/a"])
                 continue
 
-            def _gap():
-                gap, _c, _v, direct = pw.eigenvalue_band_properties
-                return "Metallic" if (gap is None or gap <= 0.01) else \
-                    f"{gap:.3f} eV ({'d' if direct else 'i'})"
             rows.append([
                 label,
                 pw.final_structure.composition.reduced_formula,
                 _final_energy_text(pw, short=True),
-                _gap(),
+                _band_gap_text(pw, short=True),
                 f"{pw.efermi:.3f}" if pw.efermi is not None else "n/a",
                 str(pw.run_type),
             ])

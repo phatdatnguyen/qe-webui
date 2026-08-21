@@ -86,10 +86,20 @@ python3 webui.py
 
 ## Tests
 
-The test suite needs no Quantum Espresso installation, no pseudopotentials and no
-network — every case runs against a temporary working directory:
+The default suite needs no Quantum Espresso installation, no pseudopotentials and
+no network — every case runs against a temporary working directory:
 
 ```
 pip install pytest
 python3 -m pytest
+```
+
+There is also an end-to-end suite that really runs `pw.x`, `dos.x` and a relaxation
+on a small silicon cell (about a minute). It is opt-in, and skips itself unless the
+QE binaries and `mpirun` are on your PATH and `$ESPRESSO_PSEUDO` is set, so run it
+from the same shell you start the web UI from:
+
+```
+python3 -m pytest -m qe        # just the QE runs
+python3 -m pytest -m ""        # everything
 ```

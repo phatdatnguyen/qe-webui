@@ -260,14 +260,104 @@ class TestRunCalculationType:
         assert R._run_calculation_type(run) == ""
 
 
+def eigen(energies, occupancies):
+    """An eigenvalue array of shape (n_kpoints, n_bands, 2), as PWxml exposes it."""
+    return np.stack([np.array(energies, dtype=float),
+                     np.array(occupancies, dtype=float)], axis=-1)
+
+
+def spin_run(energies, occupancies, kpoints=None, **extra):
+    """A run with one spin channel and the given per-k-point bands."""
+    from pymatgen.electronic_structure.core import Spin
+    kpoints = kpoints if kpoints is not None else [[0, 0, 0]] * len(energies)
+    return StubRun(eigenvalues={Spin.up: eigen(energies, occupancies)},
+                   actual_kpoints=kpoints, **extra)
+
+
+class TestBandEdges:
+    def test_a_direct_gap(self):
+        run = spin_run(energies=[[-5.0, -1.0, 2.0], [-4.5, -2.0, 3.0]],
+                       occupancies=[[1, 1, 0], [1, 1, 0]],
+                       kpoints=[[0, 0, 0], [0.5, 0, 0]])
+        vbm, cbm, is_direct = R.band_edges(run)
+        assert (vbm, cbm) == (-1.0, 2.0) and is_direct
+
+    def test_an_indirect_gap(self):
+        run = spin_run(energies=[[-5.0, -1.0, 3.0], [-4.5, -2.0, 2.0]],
+                       occupancies=[[1, 1, 0], [1, 1, 0]],
+                       kpoints=[[0, 0, 0], [0.5, 0, 0]])
+        vbm, cbm, is_direct = R.band_edges(run)
+        assert (vbm, cbm) == (-1.0, 2.0) and not is_direct
+
+    def test_smearing_tails_do_not_swallow_the_gap(self):
+        """The silicon regression: conduction states carry small occupancies, so a
+        threshold on occupancy walks the 'VBM' up into the conduction band."""
+        run = spin_run(energies=[[-5.0, -1.0, 2.0, 2.5], [-4.5, -1.2, 2.2, 2.7]],
+                       occupancies=[[1.0, 0.998, 0.002, 1e-7],
+                                    [1.0, 0.997, 0.003, 1e-7]])
+        vbm, cbm, _direct = R.band_edges(run)
+        assert (vbm, cbm) == (-1.0, 2.0)          # not (2.2, 2.5)
+        assert R._band_gap_text(run) == "3.000 eV (direct)"
+
+    def test_a_metal_has_no_gap(self):
+        run = spin_run(energies=[[-5.0, -1.0, 0.5], [-4.5, 1.0, 0.2]],
+                       occupancies=[[1, 1, 0], [1, 0.5, 0.5]],
+                       kpoints=[[0, 0, 0], [0.5, 0, 0]])
+        vbm, cbm, _direct = R.band_edges(run)
+        assert cbm < vbm
+        assert R._band_gap_text(run) == "Metallic (no gap)"
+
+    def test_a_gap_under_the_tolerance_reads_as_metallic(self):
+        run = spin_run(energies=[[0.0, R.GAP_TOL / 2]], occupancies=[[1, 0]])
+        assert R._band_gap_text(run) == "Metallic (no gap)"
+
+    def test_both_spin_channels_are_considered(self):
+        from pymatgen.electronic_structure.core import Spin
+        run = StubRun(
+            eigenvalues={
+                # Up is filled higher, down has the lower conduction band.
+                Spin.up: eigen([[-5.0, -1.0, 4.0]], [[1, 1, 0]]),
+                Spin.down: eigen([[-5.0, -3.0, 2.0]], [[1, 1, 0]]),
+            },
+            actual_kpoints=[[0, 0, 0]])
+        vbm, cbm, _direct = R.band_edges(run)
+        assert (vbm, cbm) == (-1.0, 2.0)
+
+    def test_a_run_without_empty_bands_cannot_answer(self):
+        run = spin_run(energies=[[-5.0, -1.0]], occupancies=[[1, 1]])
+        assert R.band_edges(run) is None
+        assert R._band_gap_text(run) == "n/a"
+
+    def test_a_run_without_occupied_bands_cannot_answer(self):
+        run = spin_run(energies=[[-5.0, -1.0]], occupancies=[[0, 0]])
+        assert R.band_edges(run) is None
+
+    @pytest.mark.parametrize("eigenvalues", [None, {}])
+    def test_a_run_without_eigenvalues_cannot_answer(self, eigenvalues):
+        assert R.band_edges(StubRun(eigenvalues=eigenvalues)) is None
+
+    @pytest.mark.parametrize("short,expected", [
+        (False, "3.000 eV (direct)"), (True, "3.000 eV (d)"),
+    ])
+    def test_the_short_form_fits_a_table_cell(self, short, expected):
+        run = spin_run(energies=[[-1.0, 2.0]], occupancies=[[1, 0]])
+        assert R._band_gap_text(run, short=short) == expected
+
+    def test_the_short_metallic_form(self):
+        run = spin_run(energies=[[-1.0, -2.0]], occupancies=[[1, 0]])
+        assert R._band_gap_text(run, short=True) == "Metallic"
+
+
 class TestBuildSummaryDataframe:
     def full_run(self):
         from pymatgen.core import Lattice, Structure
         structure = Structure(Lattice.cubic(5.64), ["Na", "Cl"],
                               [[0, 0, 0], [0.5, 0.5, 0.5]])
+        from pymatgen.electronic_structure.core import Spin
         return StubRun(
             calculation="scf", final_energy=-1234.5,
-            eigenvalue_band_properties=(5.1, 6.0, 0.9, True),
+            eigenvalues={Spin.up: eigen([[-5.0, -1.0, 4.1]], [[1, 1, 0]])},
+            actual_kpoints=[[0, 0, 0]],
             efermi=3.25, converged_electronic=True, converged_ionic=False,
             run_type="PBE", final_structure=structure, nionic_steps=1)
 
@@ -275,15 +365,16 @@ class TestBuildSummaryDataframe:
         table = R.build_summary_dataframe(bundle_for(self.full_run()))
         values = dict(zip(table["Property"], table["Value"]))
         assert values["Final total energy (eV)"] == "-1234.500000"
-        assert values["Band gap"] == "5.100 eV (direct)"
+        assert values["Band gap"] == "5.100 eV (direct)"      # 4.1 - (-1.0)
         assert values["Fermi level"] == "3.2500 eV"
         assert values["Converged (electronic)"] == "True"
         assert values["Formula"] == "NaCl"
         assert values["Number of sites"] == "2"
 
     def test_a_tiny_gap_counts_as_metallic(self):
+        from pymatgen.electronic_structure.core import Spin
         run = self.full_run()
-        run.eigenvalue_band_properties = (0.001, 0.0, 0.0, False)
+        run.eigenvalues = {Spin.up: eigen([[-5.0, -1.0, -0.999]], [[1, 1, 0]])}
         table = R.build_summary_dataframe(bundle_for(run))
         assert dict(zip(table["Property"], table["Value"]))["Band gap"] == \
             "Metallic (no gap)"
