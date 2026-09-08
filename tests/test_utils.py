@@ -1,7 +1,9 @@
 """utils.py — the file list every dropdown is built from, and name validation."""
 import os
+import copy
 
 import pytest
+from gradio.utils import deep_hash
 
 from utils import get_files_in_working_directory, sort_by_name, validate_name
 
@@ -43,6 +45,19 @@ class TestGetFilesInWorkingDirectory:
         file_path = os.path.join(working_dir, "a.cif")
         open(file_path, "w").close()
         assert get_files_in_working_directory(file_path) == []
+
+    def test_overwriting_existing_files_still_notifies_gradio(self, working_dir):
+        file_path = os.path.join(working_dir, "scf.in")
+        with open(file_path, "w") as fh:
+            fh.write("old input")
+        before = get_files_in_working_directory(working_dir)
+        with open(file_path, "w") as fh:
+            fh.write("new input")
+        after = get_files_in_working_directory(working_dir)
+        assert before == after == ["scf.in"]
+        assert deep_hash(before) == deep_hash(before)
+        assert deep_hash(before) != deep_hash(after)
+        assert copy.deepcopy(after) == ["scf.in"]
 
 
 class TestValidateName:

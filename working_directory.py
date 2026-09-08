@@ -32,14 +32,19 @@ def on_open_working_directory(working_directory):
     error = validate_name(working_directory, "working directory name")
     if error:
         gr.Warning(error)
-        return gr.update(), None, None, gr.update()
+        return gr.update(), None, None, gr.update(interactive=False)
 
     working_directory = working_directory.strip()
     working_directory_path = os.path.join("./data/", working_directory)
-    os.makedirs(working_directory_path, exist_ok=True)
-    files = get_files_in_working_directory(working_directory_path)
+    try:
+        os.makedirs(working_directory_path, exist_ok=True)
+        files = get_files_in_working_directory(working_directory_path)
+        directories = get_working_directories()
+    except OSError as exc:
+        gr.Warning("Error opening working directory!\n" + str(exc))
+        return gr.update(), None, None, gr.update(interactive=False)
 
-    return gr.update(choices=get_working_directories(), value=working_directory), working_directory_path, files, gr.update(interactive=True)
+    return gr.update(choices=directories, value=working_directory), working_directory_path, files, gr.update(interactive=True)
 
 
 def _classify_file(f):
@@ -109,10 +114,20 @@ def on_selected_text_file_state_change(state):
     return gr.update(interactive=(state is not None))
 
 
+def _working_file_path(working_directory_path, file_name):
+    """Resolve a selected file only after a working directory has been opened."""
+    if not working_directory_path or not os.path.isdir(working_directory_path):
+        raise ValueError("Please open a working directory first.")
+    if (not file_name or os.path.basename(file_name) != file_name
+            or file_name in (".", "..")):
+        raise ValueError("Please select a file in the working directory.")
+    return os.path.join(working_directory_path, file_name)
+
+
 def on_upload_file(working_directory_path, file_path):
     try:
-        shutil.copy2(file_path, os.path.join(working_directory_path,
-                                             os.path.basename(file_path)))
+        destination = _working_file_path(working_directory_path, os.path.basename(file_path))
+        shutil.copy2(file_path, destination)
     except Exception as exc:
         gr.Warning("Error uploading file!\n" + str(exc))
     return get_files_in_working_directory(working_directory_path)
@@ -122,8 +137,8 @@ def on_delete_file(working_directory_path, selected_file_name):
     if selected_file_name is None:
         return get_files_in_working_directory(working_directory_path)
 
-    file_path = os.path.join(working_directory_path, selected_file_name)
     try:
+        file_path = _working_file_path(working_directory_path, selected_file_name)
         os.remove(file_path)
         status = "File deleted successfully."
     except Exception as exc:
@@ -139,7 +154,7 @@ def on_view_structure_file(working_directory_path, file_name, x, y, z):
 
     try:
         # Load structure using pymatgen
-        file_path = os.path.join(working_directory_path, file_name)
+        file_path = _working_file_path(working_directory_path, file_name)
         structure = Structure.from_file(file_path)
 
         # Make supercell
@@ -156,7 +171,7 @@ def on_view_structure_file(working_directory_path, file_name, x, y, z):
         nglview.write_html('./static/input_structure.html', [view])
 
         # Read the HTML file
-        timestamp = int(time.time())
+        timestamp = time.time_ns()
         html = f'<iframe src="/static/input_structure.html?ts={timestamp}" height="500" width="500" title="NGL View"></iframe>'
 
         return html
@@ -171,8 +186,8 @@ def on_view_text_file(working_directory_path, text_file_name):
         gr.Warning("Please select a text file to view.")
         return gr.update(), gr.update()
 
-    text_file_path = os.path.join(working_directory_path, text_file_name)
     try:
+        text_file_path = _working_file_path(working_directory_path, text_file_name)
         with open(text_file_path, 'r') as file:
             content = file.read()
         return gr.update(label=f"Text File Viewer - {text_file_name}", value=content, interactive=True), gr.update(interactive=True)
@@ -186,8 +201,8 @@ def on_save_text_file(working_directory_path, text_file_name, text_content):
         gr.Warning("Please select a text file to save.")
         return get_files_in_working_directory(working_directory_path)
 
-    text_file_path = os.path.join(working_directory_path, text_file_name)
     try:
+        text_file_path = _working_file_path(working_directory_path, text_file_name)
         with open(text_file_path, 'w') as file:
             file.write(text_content)
         status = "File saved successfully."
@@ -196,6 +211,35 @@ def on_save_text_file(working_directory_path, text_file_name, text_content):
     gr.Warning(status)
 
     return get_files_in_working_directory(working_directory_path)
+
+
+def on_load_text_editor(working_directory_path, text_file_name):
+    """Keep the save target attached to the text actually loaded in the editor."""
+    viewer, save_button = on_view_text_file(working_directory_path, text_file_name)
+    if "value" not in viewer:
+        return (gr.update(value="", label="Text File Viewer", interactive=False),
+                gr.update(interactive=False), None)
+    target = (os.path.abspath(working_directory_path), text_file_name)
+    return viewer, save_button, target
+
+
+def on_save_text_editor(working_directory_path, target, text_content):
+    if (not target or not working_directory_path
+            or os.path.abspath(working_directory_path) != target[0]):
+        gr.Warning("Please view a text file in the current working directory before saving.")
+        return get_files_in_working_directory(working_directory_path)
+    if not os.path.isfile(os.path.join(target[0], target[1])):
+        gr.Warning("The file open in the editor no longer exists. Please select a file again.")
+        return get_files_in_working_directory(working_directory_path)
+    return on_save_text_file(working_directory_path, target[1], text_content)
+
+
+def on_working_directory_change():
+    """Discard selections and editor contents belonging to the previous folder."""
+    return (None, None, None, gr.update(interactive=False),
+            gr.update(interactive=False), gr.update(interactive=False), None,
+            gr.update(value="", label="Text File Viewer", interactive=False),
+            gr.update(interactive=False), None)
 
 
 def working_directory_blocks():
@@ -208,6 +252,7 @@ def working_directory_blocks():
         selected_file_state = gr.State()
         selected_structure_file_state = gr.State()
         selected_text_file_state = gr.State()
+        text_editor_target_state = gr.State()
         with gr.Row():
             add_file_upload_button = gr.UploadButton(label="Add File", interactive=False)
             delete_file_button = gr.Button(value="Delete Selected File", interactive=False)
@@ -223,6 +268,13 @@ def working_directory_blocks():
     working_directory_dropdown.change(on_open_working_directory, working_directory_dropdown, [working_directory_dropdown, working_directory_path_state, working_directory_file_list_state, add_file_upload_button])
     open_working_directory_button.click(on_open_working_directory, working_directory_dropdown, [working_directory_dropdown, working_directory_path_state, working_directory_file_list_state, add_file_upload_button])
     working_directory_file_list_state.change(on_file_list_change, working_directory_path_state, working_directory_file_dataframe)
+    working_directory_path_state.change(on_file_list_change, working_directory_path_state, working_directory_file_dataframe)
+    working_directory_path_state.change(
+        on_working_directory_change, [],
+        [selected_file_state, selected_structure_file_state, selected_text_file_state,
+         delete_file_button, view_structure_button, view_text_file_button,
+         structure_viewer_html, text_file_viewer_textarea, save_text_file_button,
+         text_editor_target_state])
     working_directory_file_dataframe.select(on_select_file, [], [selected_file_state, selected_structure_file_state, selected_text_file_state, delete_file_button])
     selected_structure_file_state.change(on_selected_structure_file_state_change, selected_structure_file_state, view_structure_button)
     selected_text_file_state.change(on_selected_text_file_state_change, selected_text_file_state, view_text_file_button)
@@ -232,7 +284,7 @@ def working_directory_blocks():
     x_input_slider.change(on_view_structure_file, [working_directory_path_state, selected_structure_file_state, x_input_slider, y_input_slider, z_input_slider], structure_viewer_html)
     y_input_slider.change(on_view_structure_file, [working_directory_path_state, selected_structure_file_state, x_input_slider, y_input_slider, z_input_slider], structure_viewer_html)
     z_input_slider.change(on_view_structure_file, [working_directory_path_state, selected_structure_file_state, x_input_slider, y_input_slider, z_input_slider], structure_viewer_html)
-    view_text_file_button.click(on_view_text_file, [working_directory_path_state, selected_text_file_state], [text_file_viewer_textarea, save_text_file_button])
-    save_text_file_button.click(on_save_text_file, [working_directory_path_state, selected_text_file_state, text_file_viewer_textarea], working_directory_file_list_state)
+    view_text_file_button.click(on_load_text_editor, [working_directory_path_state, selected_text_file_state], [text_file_viewer_textarea, save_text_file_button, text_editor_target_state])
+    save_text_file_button.click(on_save_text_editor, [working_directory_path_state, text_editor_target_state, text_file_viewer_textarea], working_directory_file_list_state)
 
     return working_directory_path_state, working_directory_file_list_state

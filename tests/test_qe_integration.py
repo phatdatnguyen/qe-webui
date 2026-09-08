@@ -21,6 +21,7 @@ from pymatgen.core import Lattice, Structure
 
 import calculation as C
 import result as R
+import automation as A
 
 # Silicon in its standard primitive cell: two atoms, converges in a few seconds,
 # and is bands-ready (see calculation.ensure_bands_cell).
@@ -424,3 +425,28 @@ class TestRelax:
         energies = figure.axes[0].lines[0].get_ydata()
         assert len(energies) > 1
         assert energies[-1] <= energies[0] + 1e-6      # the relax went downhill
+
+
+def test_relax_workflow_runs_scf_on_the_relaxed_geometry(working_dir):
+    """A shared prefix alone must not send SCF back to the original positions."""
+    import numpy as np
+    from pymatgen.io.pwscf import PWInput
+
+    displaced = SILICON.copy()
+    displaced.translate_sites([1], [0.02, 0.01, 0.0])
+    displaced.to(filename=os.path.join(working_dir, "displaced.cif"))
+    status, log = "", ""
+    for status, log in A.on_run_workflow(
+        working_dir, "Relax → SCF", "displaced.cif", PSEUDO_SET,
+        ECUTWFC, ECUTRHO, *KGRID, C.DEFAULT_FUNCTIONAL, "", "si_workflow", 1, "",
+    ):
+        pass
+    assert "finished successfully" in status, f"{status}\n{log[-2000:]}"
+    relaxed = Structure.from_file(os.path.join(working_dir, "relax.cif"))
+    scf_input = PWInput.from_file(os.path.join(working_dir, "scf.in")).structure
+    assert not np.allclose(relaxed.frac_coords, displaced.frac_coords, atol=1e-4)
+    assert np.allclose(scf_input.frac_coords, relaxed.frac_coords, atol=1e-6)
+    assert np.allclose(scf_input.lattice.matrix, relaxed.lattice.matrix, atol=1e-6)
+    final = R.parse_qe_outputs(working_dir, "out/si_workflow.xml")["pwxml"]
+    assert R._run_calculation_type(final) == "scf"
+    assert final.final_energy < 0

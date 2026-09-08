@@ -5,6 +5,7 @@ an event wired to a component or handler that does not line up. Everything is
 built in a temp cwd so ./static and ./data of the real project are untouched.
 """
 import inspect
+import asyncio
 import os
 import shutil
 
@@ -15,6 +16,8 @@ import automation
 import calculation
 import result
 import working_directory
+from gradio.state_holder import SessionState
+from utils import get_files_in_working_directory
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -96,3 +99,24 @@ class TestAppBuilds:
             taken.bind(("localhost", 0))
             busy = taken.getsockname()[1]
             assert webui.find_available_port(busy) > busy
+
+
+def test_same_filename_refresh_triggers_the_file_state_event_hub(working_dir):
+    path = os.path.join(working_dir, "scf.in")
+    with open(path, "w") as fh:
+        fh.write("original input")
+
+    async def refresh():
+        return get_files_in_working_directory(working_dir)
+
+    with gr.Blocks() as blocks:
+        files = gr.State(get_files_in_working_directory(working_dir))
+        gr.Button().click(refresh, [], files)
+        files.change(lambda: None, [], [])
+    session = SessionState(blocks)
+    assert session[files._id] == ["scf.in"]
+    with open(path, "w") as fh:
+        fh.write("updated input")
+    response = asyncio.run(blocks.process_api(0, [], state=session))
+    assert response["changed_state_ids"] == [files._id]
+    assert session[files._id] == ["scf.in"]

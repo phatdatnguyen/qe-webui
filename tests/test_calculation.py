@@ -3,6 +3,7 @@
 Nothing here needs QE: the one place a process would be spawned (run_qe_stream)
 is exercised against a fake subprocess.
 """
+import io
 import os
 
 import pytest
@@ -117,6 +118,11 @@ class TestParseExtraSettings:
         assert C.parse_extra_settings("control.title = a=b") == \
             {"control": {"title": "a=b"}}
 
+    def test_fortran_exponents_and_case_insensitive_keys(self):
+        assert C.parse_extra_settings(
+            "ELECTRONS.CONV_THR = 1.0D-8\nSYSTEM.ECUTWFC = 60") == {
+                "electrons": {"conv_thr": 1e-8}, "system": {"ecutwfc": 60}}
+
     @pytest.mark.parametrize("line", ["nbnd = 24", "system nbnd 24", "system.nbnd"])
     def test_malformed_lines_raise(self, line):
         with pytest.raises(Exception, match="Cannot parse extra setting"):
@@ -125,6 +131,7 @@ class TestParseExtraSettings:
     @pytest.mark.parametrize("raw,expected", [
         (".true.", True), ("true", True), (".false.", False), ("false", False),
         ("24", 24), ("-3", -3), ("1e-8", 1e-8), ("0.7", 0.7),
+        ("1d-8", 1e-8), ("1.5D+2", 150.0),
         ("'quoted'", "quoted"), ('"quoted"', "quoted"), ("bare", "bare"),
     ])
     def test_coerce(self, raw, expected):
@@ -272,6 +279,24 @@ class TestGeneratePwInput:
         pw_input_args["extras"] = {"bogus": {"key": 1}}
         with pytest.raises(Exception, match="Unknown namelist"):
             C.generate_pw_input_file(**pw_input_args)
+
+    def test_fortran_settings_override_without_duplicate_keys(self, pw_input_args):
+        pw_input_args["extras"] = C.parse_extra_settings(
+            "ELECTRONS.CONV_THR = 1d-8\nSYSTEM.ECUTWFC = 60")
+        text = open(C.generate_pw_input_file(**pw_input_args)).read()
+        assert "conv_thr = 1d-08" in text
+        assert "ecutwfc = 60" in text
+        assert text.lower().count("ecutwfc =") == 1
+
+    @pytest.mark.parametrize("overrides", [
+        {"prefix": "science's"},
+        {"extras": {"control": {"prefix": "science's"}}},
+    ])
+    def test_invalid_prefix_is_rejected_before_writing(self, pw_input_args, overrides):
+        pw_input_args.update(overrides)
+        with pytest.raises(ValueError, match="apostrophe"):
+            C.generate_pw_input_file(**pw_input_args)
+        assert not os.path.exists(os.path.join(pw_input_args["working_directory_path"], "scf.in"))
 
     def test_missing_pseudo_set_raises_before_writing(self, pw_input_args, working_dir):
         pw_input_args["pseudo_dir"] = None
@@ -509,6 +534,18 @@ class TestPostInputs:
         assert path == os.path.join(working_dir, "dos.in")
         assert "fildos = 'myrun.dos'" in open(path).read()
 
+    def test_prefix_cannot_break_the_quoted_namelist_value(self):
+        with pytest.raises(ValueError, match="apostrophe"):
+            C.build_post_input("dos", "science's")
+
+    def test_invalid_post_settings_preserve_the_existing_input(self, working_dir):
+        path = os.path.join(working_dir, "dos.in")
+        with open(path, "w") as fh:
+            fh.write("existing input")
+        with pytest.raises(ValueError, match="apostrophe"):
+            C.write_post_input_file(working_dir, "dos", "science's", "dos.in")
+        assert open(path).read() == "existing input"
+
 
 # --------------------------------------------------------------------------- #
 # The Gradio wrapper around generation
@@ -729,12 +766,12 @@ class FakeProcess:
         FakeProcess.instances.append(self)
         self.command = args
         self.kwargs = kwargs
-        self.stdout = iter(["JOB DONE line 1\n", "line 2\n"])
+        self.stdout = io.StringIO("JOB DONE line 1\nline 2\n")
         self.returncode = 0
         self.pid = 12345
         self.waited = False
 
-    def wait(self):
+    def wait(self, timeout=None):
         self.waited = True
         return self.returncode
 
@@ -746,6 +783,7 @@ class FakeProcess:
 def fake_popen(monkeypatch):
     FakeProcess.instances = []
     monkeypatch.setattr(C.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(C.os, "killpg", lambda *_args: None)
     return FakeProcess
 
 
@@ -780,6 +818,131 @@ class TestRunQeStream:
                                                               fake_popen):
         list(C.run_qe_stream(working_dir, 1, "/opt/qe/pw.x", "scf.in", "scf.out"))
         assert C._current_process is None
+        assert fake_popen.instances[0].stdout.closed
+
+    @pytest.mark.parametrize("output_name", ["../escaped.out", "/tmp/escaped.out"])
+    def test_output_must_be_a_file_in_the_working_directory(self, working_dir,
+                                                          fake_popen, output_name):
+        with pytest.raises(ValueError, match="output file name"):
+            list(C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", output_name))
+        assert not fake_popen.instances
+
+    @pytest.mark.parametrize("alias", ["same_name", "symlink", "hardlink"])
+    def test_the_output_cannot_overwrite_the_input(self, working_dir, fake_popen, alias):
+        input_path = os.path.join(working_dir, "scf.in")
+        with open(input_path, "w") as fh:
+            fh.write("keep this input")
+        output_name = "scf.in" if alias == "same_name" else "scf.out"
+        if alias == "symlink":
+            os.symlink(input_path, os.path.join(working_dir, output_name))
+        elif alias == "hardlink":
+            os.link(input_path, os.path.join(working_dir, output_name))
+        with pytest.raises(ValueError, match="different from the input"):
+            list(C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", output_name))
+        assert open(input_path).read() == "keep this input"
+        assert not fake_popen.instances
+
+    def test_output_symlink_cannot_write_outside_the_directory(self, working_dir,
+                                                              tmp_path, fake_popen):
+        target = tmp_path / "outside.out"
+        target.write_text("preserve")
+        os.symlink(target, os.path.join(working_dir, "scf.out"))
+        with pytest.raises(ValueError, match="inside the working directory"):
+            list(C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "scf.out"))
+        assert target.read_text() == "preserve"
+        assert not fake_popen.instances
+
+    def test_a_bad_log_destination_never_launches_mpi(self, working_dir, fake_popen):
+        os.mkdir(os.path.join(working_dir, "scf.out"))
+        with pytest.raises(IsADirectoryError):
+            list(C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "scf.out"))
+        assert not fake_popen.instances
+        # A failed setup must also release the slot for the next run.
+        list(C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "retry.out"))
+
+    def test_overlapping_run_does_not_replace_the_process_or_log(self, working_dir,
+                                                                fake_popen):
+        stream = C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "scf.out")
+        next(stream)
+        first = C._current_process
+        try:
+            with pytest.raises(RuntimeError, match="already running"):
+                list(C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "scf.out"))
+            assert C._current_process is first
+            assert len(fake_popen.instances) == 1
+            assert open(os.path.join(working_dir, "scf.out")).read() == "JOB DONE line 1\n"
+        finally:
+            stream.close()
+
+    @pytest.mark.parametrize("failure", ["cancel", "read_error", "unresponsive"])
+    def test_interrupted_stream_terminates_and_reaps_mpi(self, working_dir,
+                                                       monkeypatch, failure):
+        signals = []
+
+        class Running(FakeProcess):
+            def __init__(self, args, **kwargs):
+                super().__init__(args, **kwargs)
+                self.returncode = None
+                if failure == "read_error":
+                    class BrokenLog(io.StringIO):
+                        def __next__(self):
+                            raise OSError("read failed")
+                    self.stdout = BrokenLog()
+
+            def wait(self, timeout=None):
+                if timeout is not None and failure == "unresponsive":
+                    raise C.subprocess.TimeoutExpired(self.command, timeout)
+                self.waited = True
+                self.returncode = -15
+                return self.returncode
+
+        monkeypatch.setattr(C.subprocess, "Popen", Running)
+        monkeypatch.setattr(C.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+        stream = C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "scf.out")
+        if failure == "read_error":
+            with pytest.raises(OSError, match="read failed"):
+                next(stream)
+            process = FakeProcess.instances[-1]
+        else:
+            next(stream)
+            process = C._current_process
+            stream.close()
+        assert signals == [(process.pid, C.signal.SIGTERM),
+                           (process.pid, C.signal.SIGKILL)]
+        assert process.waited and process.stdout.closed
+        assert C._current_process is None
+
+    @pytest.mark.parametrize("leader_already_exited", [False, True])
+    def test_cleanup_kills_descendants_after_the_shell_exits(self, working_dir,
+                                                            monkeypatch,
+                                                            leader_already_exited):
+        group = {"alive": True}
+
+        class Shell(FakeProcess):
+            def __init__(self, args, **kwargs):
+                super().__init__(args, **kwargs)
+                self.returncode = 0 if leader_already_exited else None
+
+            def wait(self, timeout=None):
+                # The shell exits on TERM, while a rank ignores it.
+                self.waited = True
+                self.returncode = 0
+                return self.returncode
+
+        def signal_group(pid, sig):
+            assert pid == 12345
+            if sig == C.signal.SIGKILL:
+                group["alive"] = False
+
+        monkeypatch.setattr(C.subprocess, "Popen", Shell)
+        monkeypatch.setattr(C.os, "killpg", signal_group)
+        stream = C.run_qe_stream(working_dir, 1, "pw.x", "scf.in", "scf.out")
+        next(stream)
+        process = C._current_process
+        stream.close()
+        assert not group["alive"]
+        assert process.waited and process.stdout.closed
+        assert C._current_process is None and not C._run_lock.locked()
 
 
 class TestOnRunCalculation:
@@ -812,7 +975,7 @@ class TestOnRunCalculation:
         assert "color:red" in final[0] and "error code 2" in final[0]
 
     def test_a_stopped_run_is_reported_as_stopped(self, working_dir, qe_bin,
-                                                  monkeypatch):
+                                                  monkeypatch, fake_popen):
         open(os.path.join(working_dir, "scf.in"), "w").close()
 
         class Killed(FakeProcess):

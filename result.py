@@ -1,5 +1,6 @@
 import os
 import glob
+import re
 import time
 import numpy as np
 import pandas as pd
@@ -35,14 +36,12 @@ def find_qe_xml(working_directory_path):
         os.path.join(working_directory_path, OUTDIR, f"{PREFIX}.save", "data-file-schema.xml"),
     ]
     for c in candidates:
-        if os.path.exists(c):
+        if os.path.isfile(c):
             return c
-    # Fall back to any .xml under the working dir / outdir (sorted for determinism).
-    for pattern in (os.path.join(working_directory_path, OUTDIR, "*.xml"),
-                    os.path.join(working_directory_path, "*.xml")):
-        hits = sorted(glob.glob(pattern))
-        if hits:
-            return hits[0]
+    # Use the same filtering as the picker, including non-default .save runs.
+    choices = find_xml_choices(working_directory_path)
+    if choices:
+        return os.path.join(working_directory_path, default_xml_choice(choices))
     return None
 
 
@@ -58,7 +57,7 @@ def find_xml_choices(working_directory_path):
         return []
     hits = glob.glob(os.path.join(working_directory_path, "**", "*.xml"), recursive=True)
     rels = sort_by_name(os.path.relpath(h, working_directory_path).replace(os.sep, "/")
-                        for h in hits)
+                        for h in hits if os.path.isfile(h))
 
     choices = []
     for rel in rels:
@@ -103,9 +102,12 @@ def parse_qe_outputs(working_directory_path, xml_rel=None):
     xml_path = None
     if xml_rel:
         candidate = os.path.join(working_directory_path, xml_rel)
-        if os.path.exists(candidate):
-            xml_path = candidate
-    if xml_path is None:
+        if not os.path.isfile(candidate):
+            bundle["errors"].append(f"Selected QE XML output '{xml_rel}' no longer exists. "
+                                    "Refresh the output-file selection and try again.")
+            return bundle
+        xml_path = candidate
+    else:
         xml_path = find_qe_xml(working_directory_path)
     if xml_path is None:
         bundle["errors"].append("No Quantum Espresso XML output found "
@@ -163,7 +165,7 @@ def band_edges(pwxml):
     if not eigenvalues:
         return None
 
-    vbm, cbm, vbm_k, cbm_k = -np.inf, np.inf, None, None
+    filled_edges, empty_edges = [], []
     for values in eigenvalues.values():
         energies, occupancies = values[:, :, 0], values[:, :, 1]
         # Per spin channel each band holds one electron, so the occupancies at a
@@ -173,16 +175,26 @@ def band_edges(pwxml):
             return None
 
         highest_filled, lowest_empty = energies[:, n_occupied - 1], energies[:, n_occupied]
-        if highest_filled.max() > vbm:
-            vbm, vbm_k = float(highest_filled.max()), int(highest_filled.argmax())
-        if lowest_empty.min() < cbm:
-            cbm, cbm_k = float(lowest_empty.min()), int(lowest_empty.argmin())
+        filled_edges.append(highest_filled)
+        empty_edges.append(lowest_empty)
 
+    vbm = float(max(values.max() for values in filled_edges))
+    cbm = float(min(values.min() for values in empty_edges))
+    # Include every degenerate edge: the first maximum/minimum can be at
+    # different k-points even when another VBM and CBM share a k-point.
+    vbm_ks = {int(i) for values in filled_edges
+              for i in np.flatnonzero(np.isclose(values, vbm, atol=1e-5, rtol=0))}
+    cbm_ks = {int(i) for values in empty_edges
+              for i in np.flatnonzero(np.isclose(values, cbm, atol=1e-5, rtol=0))}
+    is_direct = bool(vbm_ks & cbm_ks)
     kpoints = getattr(pwxml, "actual_kpoints", None)
-    if kpoints is not None and max(vbm_k, cbm_k) < len(kpoints):
-        is_direct = bool(np.allclose(kpoints[vbm_k], kpoints[cbm_k], atol=1e-6))
-    else:
-        is_direct = vbm_k == cbm_k
+    if not is_direct and kpoints is not None and max(vbm_ks | cbm_ks) < len(kpoints):
+        # Fractional reciprocal coordinates differing by an integer represent
+        # the same k-point, including repeated endpoints of a band path.
+        is_direct = any(
+            np.allclose(delta, np.round(delta), atol=1e-6, rtol=0)
+            for i in vbm_ks for j in cbm_ks
+            for delta in [np.asarray(kpoints[i]) - np.asarray(kpoints[j])])
     return vbm, cbm, is_direct
 
 
@@ -322,23 +334,30 @@ def _kpath_length(k_card):
     return sum(weights[:-1]) + 1 if weights else None
 
 
-def _find_bands_input(working_directory_path, nkpoints=None):
-    """Locate the pw.x 'bands' input (K_POINTS crystal_b) needed for k-labels.
-
-    Candidates are scanned in name order for determinism. When nkpoints is given,
-    an input whose k-path expands to exactly that many points wins, so the right
-    file is chosen when several bands runs live in the same directory.
-    """
+def _bands_input_candidates(working_directory_path):
+    """List inputs with an actual crystal_b card, excluding comment mentions."""
     candidates = []
-    for path in sort_by_name(glob.glob(os.path.join(working_directory_path, "*.in"))):
+    inputs = [path for suffix in ("*.in", "*.pwi")
+              for path in glob.glob(os.path.join(working_directory_path, suffix))]
+    for path in sort_by_name(inputs):
         try:
             with open(path) as fh:
-                if "crystal_b" not in fh.read().lower():
+                if not re.search(r"^\s*K_POINTS\s*(?:[({]\s*)?crystal_b\b",
+                                 fh.read(), re.IGNORECASE | re.MULTILINE):
                     continue
         except Exception:
             continue
         candidates.append(path)
+    return candidates
 
+
+def _find_bands_input(working_directory_path, nkpoints=None):
+    """Find an input by point count for callers without a parsed run.
+
+    Result plots use _bands_input_for, which additionally checks the QE prefix
+    and the actual path before attaching labels to a run.
+    """
+    candidates = _bands_input_candidates(working_directory_path)
     if nkpoints is not None:
         for path in candidates:
             try:
@@ -347,6 +366,25 @@ def _find_bands_input(working_directory_path, nkpoints=None):
             except Exception:
                 continue
     return candidates[0] if candidates else None
+
+
+def _expanded_kpath(k_card):
+    """Expand a crystal_b card to QE's ordered fractional reciprocal coordinates."""
+    try:
+        vertices = np.asarray(k_card.k, dtype=float)
+        weights = np.asarray(k_card.weights, dtype=float)
+        if (str(k_card.option) != "crystal_b" or vertices.ndim != 2
+                or vertices.shape[1] != 3 or len(vertices) != len(weights)
+                or not len(vertices) or not np.isfinite(vertices).all()
+                or not np.isfinite(weights).all()
+                or np.any(weights[:-1] < 1)
+                or np.any(weights[:-1] != np.floor(weights[:-1]))):
+            return None
+        segments = [np.linspace(start, end, int(weight), endpoint=False)
+                    for start, end, weight in zip(vertices[:-1], vertices[1:], weights[:-1])]
+        return np.concatenate(segments + [vertices[-1:]], axis=0)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _bands_input_for(bundle, what="Band-structure plot"):
@@ -361,13 +399,50 @@ def _bands_input_for(bundle, what="Band-structure plot"):
     except Exception:
         nkpoints = None
 
-    path = _find_bands_input(bundle["path"], nkpoints)
-    if not path:
+    candidates = _bands_input_candidates(bundle["path"])
+    if not candidates:
         return None, (f"{what} needs the line-mode 'bands' input file "
                       "(K_POINTS crystal_b) in this directory. Generate and run a "
                       "'bands' calculation, then reload.")
+    run_prefix = getattr(pwxml, "prefix", None) or bundle.get("prefix")
     try:
-        k_card = PWin.from_file(path).k_points
+        actual_kpoints = np.asarray(pwxml.actual_kpoints, dtype=float)
+        if (actual_kpoints.ndim != 2 or actual_kpoints.shape[1] != 3
+                or not len(actual_kpoints) or not np.isfinite(actual_kpoints).all()):
+            actual_kpoints = None
+    except (AttributeError, TypeError, ValueError):
+        actual_kpoints = None
+
+    def matches_path(k_card):
+        if actual_kpoints is None or _kpath_length(k_card) != len(actual_kpoints):
+            return False
+        expanded = _expanded_kpath(k_card)
+        return (expanded is not None and actual_kpoints is not None
+                and expanded.shape == actual_kpoints.shape
+                and np.allclose(expanded, actual_kpoints, atol=1e-6, rtol=0))
+
+    path = candidates[0]
+    if len(candidates) > 1:
+        matching = []
+        for candidate in candidates:
+            try:
+                inp = PWin.from_file(candidate)
+                if (run_prefix and inp.control.get("prefix", PREFIX) == run_prefix
+                        and matches_path(inp.k_points)):
+                    matching.append(candidate)
+            except Exception:
+                continue
+        if len(matching) != 1:
+            reason = ("Several bands inputs match" if matching else "No bands input matches")
+            names = ", ".join(os.path.basename(p) for p in (matching or candidates))
+            return None, (f"{what}: {reason} the selected run's prefix '{run_prefix}' "
+                          f"and k-point path ({names}). Keep the original bands input "
+                          "for this XML in the directory; remove duplicate matching "
+                          "inputs or select the correct XML, then reload.")
+        path = matching[0]
+    try:
+        inp = PWin.from_file(path)
+        k_card = inp.k_points
     except Exception as exc:
         return None, f"Could not read the k-path from {os.path.basename(path)}: {exc}"
 
@@ -386,6 +461,14 @@ def _bands_input_for(bundle, what="Band-structure plot"):
                       f"the k-path in {os.path.basename(path)} has {expected}. Choose the "
                       "XML written by the line-mode 'bands' run in 'Output File to "
                       "Visualize'.")
+    if run_prefix and inp.control.get("prefix", PREFIX) != run_prefix:
+        return None, (f"{what}: {os.path.basename(path)} uses a different QE prefix "
+                      f"from the selected run ('{run_prefix}'). Choose its matching "
+                      "XML or restore the original bands input.")
+    if actual_kpoints is not None and not matches_path(k_card):
+        return None, (f"{what}: the k-point path in {os.path.basename(path)} does not "
+                      "match the selected XML, even though the point counts agree. "
+                      "Choose its matching XML or restore the original bands input.")
     return path, None
 
 
@@ -590,8 +673,11 @@ def on_compare_runs(working_directory_path, selected_xmls):
     rows = []
     plotter = DosPlotter(zero_at_efermi=True, stack=False, sigma=0.05)
     n_dos = 0
+    notes = []
+    prefixes = [_prefix_from_xml(rel) for rel in xmls]
     for rel in xmls:
-        label = os.path.splitext(os.path.basename(rel))[0]
+        prefix = _prefix_from_xml(rel)
+        label = rel if prefixes.count(prefix) > 1 else prefix
         try:
             bundle = parse_qe_outputs(working_directory_path, rel)
             pw = bundle["pwxml"]
@@ -607,7 +693,13 @@ def on_compare_runs(working_directory_path, selected_xmls):
                 f"{pw.efermi:.3f}" if pw.efermi is not None else "n/a",
                 str(pw.run_type),
             ])
+        except Exception as exc:
+            rows.append([label, "n/a", f"error: {exc}", "n/a", "n/a", "n/a"])
+            continue
 
+        # A broken optional DOS must not append a second row or discard the
+        # successfully parsed summary for this run.
+        try:
             fildos, filpdos = _find_dos_files(working_directory_path, bundle["prefix"])
             if fildos or filpdos:
                 dr = PWxml(bundle["xml_path"], parse_dos=bool(fildos), fildos=fildos,
@@ -616,12 +708,19 @@ def on_compare_runs(working_directory_path, selected_xmls):
                     plotter.add_dos(label, dr.tdos)
                     n_dos += 1
         except Exception as exc:
-            rows.append([label, "n/a", f"error: {exc}", "n/a", "n/a", "n/a"])
+            notes.append(f"DOS unavailable for {label}: {exc}")
 
     df = pd.DataFrame(rows, columns=cols)
-    fig = plotter.get_plot().figure if n_dos else None
+    fig = None
+    if n_dos:
+        try:
+            fig = plotter.get_plot().figure
+        except Exception as exc:
+            notes.append(f"Could not plot the DOS overlay: {exc}")
     msg = (f"Compared {len(xmls)} run(s); overlaid total DOS for {n_dos}."
-           if n_dos else f"Compared {len(xmls)} run(s). (No DOS files found to overlay.)")
+           if fig is not None else f"Compared {len(xmls)} run(s). (No DOS overlay available.)")
+    if notes:
+        msg += " " + "; ".join(notes)
     return df, fig, msg
 
 
@@ -731,8 +830,13 @@ def on_render_projected_bands(working_directory_path, selected_xml):
 def on_result_file_list_change(working_directory_path):
     """Clear stale results when files change; prompt the user to reload."""
     empty = pd.DataFrame(columns=["Property", "Value"])
-    hint = "<p><em>Files changed — click <b>Load / Refresh Results</b> to update.</em></p>"
+    hint = "<p><em>Click <b>Load / Refresh Results</b> to update the selected run.</em></p>"
     return (empty, None, "", None, "", None, "", None, "", hint)
+
+
+def on_clear_result_extras():
+    """Invalidate manually rendered results and downloads after directory changes."""
+    return (None, "", None, "", pd.DataFrame(), None, "", None, None)
 
 
 def on_refresh_result_files(working_directory_path, current_xml):
@@ -805,16 +909,28 @@ def result_tab_content(working_directory_path_state, working_directory_file_list
     load_results_button.click(
         on_load_results, [working_directory_path_state, result_file_dropdown, dos_mode_radio],
         section_outputs + [result_hint_markdown, status_markdown])
-    working_directory_file_list_state.change(
+    extra_outputs = [proj_bands_plot, proj_bands_status_markdown,
+                     cube_html, cube_status_markdown,
+                     compare_dataframe, compare_plot, compare_status_markdown,
+                     dos_export_button, bands_export_button]
+    # Different working directories can have identical file lists, so listen to
+    # the active path as well as the file-list event hub.
+    for state in (working_directory_file_list_state, working_directory_path_state):
+        state.change(
+            on_result_file_list_change, [working_directory_path_state],
+            section_outputs + [result_hint_markdown])
+        state.change(on_clear_result_extras, [], extra_outputs)
+        state.change(
+            on_refresh_result_files, [working_directory_path_state, result_file_dropdown],
+            result_file_dropdown)
+        state.change(
+            on_refresh_compare_files, [working_directory_path_state, compare_files_dropdown],
+            compare_files_dropdown)
+
+    result_file_dropdown.change(
         on_result_file_list_change, [working_directory_path_state],
         section_outputs + [result_hint_markdown])
-    # Keep the output-file pickers in sync as files are generated/produced.
-    working_directory_file_list_state.change(
-        on_refresh_result_files, [working_directory_path_state, result_file_dropdown],
-        result_file_dropdown)
-    working_directory_file_list_state.change(
-        on_refresh_compare_files, [working_directory_path_state, compare_files_dropdown],
-        compare_files_dropdown)
+    result_file_dropdown.change(on_clear_result_extras, [], extra_outputs)
 
     # Re-render just the DOS when the projection mode changes.
     dos_mode_radio.change(

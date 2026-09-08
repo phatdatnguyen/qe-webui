@@ -4,6 +4,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
 import warnings
 import gradio as gr
 from pymatgen.core import Structure
@@ -81,11 +82,22 @@ META_GGA = {"scan", "tpss", "m06l"}
 
 # Handle to the currently running QE process, so the Stop button can reach it.
 _current_process = None
+_run_lock = threading.Lock()
 
 
 def default_input_name(calc_type):
     """Default input-file name for a calculation type, e.g. scf -> scf.in."""
     return POST_DEFAULT_FILES.get(calc_type, f"{calc_type}.in")
+
+
+def validate_qe_prefix(prefix):
+    """Validate a name that is also embedded in QE's quoted namelist strings."""
+    error = validate_name(prefix, "output name")
+    if error:
+        raise ValueError(error)
+    if "'" in prefix:
+        raise ValueError("The output name (QE prefix) must not contain an apostrophe.")
+    return prefix.strip()
 
 
 def resolve_functional(choice, custom_text):
@@ -166,6 +178,7 @@ def _pw_sections(calc_type, pseudo_dir, ecutwfc, ecutrho, prefix):
 def build_post_input(calc_type, prefix):
     """Plain-text namelist input for a post-processing binary, referencing the
     given prefix/OUTDIR so it acts on the matching pw.x results."""
+    prefix = validate_qe_prefix(prefix)
     if calc_type == "dos":
         return (f"&DOS\n  prefix = '{prefix}'\n  outdir = '{OUTDIR}'\n"
                 f"  fildos = '{prefix}.dos'\n  deltae = 0.05\n/\n")
@@ -387,7 +400,7 @@ def parse_extra_settings(text):
                             "(expected 'namelist.key = value').")
         lhs, rhs = line.split("=", 1)
         namelist, key = lhs.strip().split(".", 1)
-        settings.setdefault(namelist.strip().lower(), {})[key.strip()] = _coerce(rhs.strip())
+        settings.setdefault(namelist.strip().lower(), {})[key.strip().lower()] = _coerce(rhs.strip())
     return settings
 
 
@@ -403,7 +416,7 @@ def _coerce(value):
     except ValueError:
         pass
     try:
-        return float(value)
+        return float(value.replace("D", "e").replace("d", "e"))
     except ValueError:
         pass
     return value.strip("'\"")
@@ -419,6 +432,7 @@ def generate_pw_input_file(working_directory_path, calc_type, structure, pseudo_
     overrides (or None). ``pseudo_dir`` is a set name from the dropdown (resolved
     under PSEUDO_ROOT) or an explicit path. Returns the written path; raises on error.
     """
+    prefix = validate_qe_prefix(prefix)
     pseudo_dir = resolve_pseudo_dir(pseudo_dir)
     pseudo = match_pseudopotentials(structure, pseudo_dir)
     control, system, electrons, ions, cell, kpoints_mode = _pw_sections(
@@ -438,6 +452,8 @@ def generate_pw_input_file(working_directory_path, calc_type, structure, pseudo_
             raise Exception(f"Unknown namelist {nml!r} in extra settings "
                             "(use control/system/electrons/ions/cell).")
         section_map[nml].update(kv)
+
+    control["prefix"] = validate_qe_prefix(control["prefix"])
 
     path = os.path.join(working_directory_path, input_file_name)
 
@@ -467,9 +483,10 @@ def generate_pw_input_file(working_directory_path, calc_type, structure, pseudo_
 
 def write_post_input_file(working_directory_path, calc_type, prefix, input_file_name):
     """Write a plain-text post-processing input (dos/projwfc/bands.x/pp.x). Returns path."""
+    text = build_post_input(calc_type, prefix)
     path = os.path.join(working_directory_path, input_file_name)
     with open(path, "w") as fh:
-        fh.write(build_post_input(calc_type, prefix))
+        fh.write(text)
     return path
 
 
@@ -661,30 +678,72 @@ def run_qe_stream(working_directory_path, num_cores, exe_path, input_file_name, 
     registers the process in _current_process so the Stop button can reach it.
     """
     global _current_process
+    error = validate_name(output_file_name, "output file name")
+    if error:
+        raise ValueError(error)
+    output_file_name = output_file_name.strip()
     out_path = os.path.join(working_directory_path, output_file_name)
+    input_path = os.path.join(working_directory_path, input_file_name)
+    real_directory = os.path.realpath(working_directory_path)
+    real_output = os.path.realpath(out_path)
+    if os.path.commonpath((real_directory, real_output)) != real_directory:
+        raise ValueError("The output file must stay inside the working directory.")
+    if (real_output == os.path.realpath(input_path)
+            or (os.path.exists(out_path) and os.path.exists(input_path)
+                and os.path.samefile(out_path, input_path))):
+        raise ValueError("The output file must be different from the input file.")
 
     # Quote exe/input names: file names may legitimately contain spaces or other
     # shell-special characters. start_new_session lets us kill the whole process
     # group (mpirun + ranks) on Stop.
     command = (f"mpirun -np {int(num_cores)} "
                f"{shlex.quote(exe_path)} -in {shlex.quote(input_file_name)}")
-    process = subprocess.Popen(
-        args=command, cwd=working_directory_path, shell=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        bufsize=1, universal_newlines=True, start_new_session=True,
-    )
-    _current_process = process
-
+    if not _run_lock.acquire(blocking=False):
+        raise RuntimeError("Another calculation is already running. Stop it or wait for it to finish.")
+    process = None
     output_log = ""
-    with open(out_path, "w") as out_file:
-        for line in process.stdout:
-            output_log += line
-            out_file.write(line)
-            out_file.flush()
-            yield output_log, None
-
-    process.wait()
-    _current_process = None
+    try:
+        # Open the log before launching MPI: a bad destination must not leave a
+        # process running with no reader and no usable output file.
+        with open(out_path, "w") as out_file:
+            process = subprocess.Popen(
+                args=command, cwd=working_directory_path, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                bufsize=1, universal_newlines=True, start_new_session=True,
+            )
+            _current_process = process
+            for line in process.stdout:
+                output_log += line
+                out_file.write(line)
+                out_file.flush()
+                yield output_log, None
+            process.wait()
+    finally:
+        try:
+            if process is not None:
+                # Generator cancellation and log/read errors must reap MPI too.
+                # The session leader's pid is also its process-group id, and
+                # MPI ranks can outlive that leader. Always signal the group,
+                # even if the shell already exited, then kill any survivors.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                if process.stdout is not None:
+                    process.stdout.close()
+        finally:
+            if _current_process is process:
+                _current_process = None
+            _run_lock.release()
     yield output_log, process.returncode
 
 
@@ -727,7 +786,6 @@ def write_relaxed_cif(working_directory_path, input_file_name, output_file_name)
 def on_run_calculation(working_directory_path, num_cores_slider, executable_name,
                        input_file_name, output_file_name, qe_bin_dir):
     """Gradio wrapper over run_qe_stream: pre-flight, then stream with status text."""
-    global _current_process
     try:
         exe, err = preflight_run(working_directory_path, executable_name, input_file_name, qe_bin_dir)
         if err:
@@ -752,7 +810,6 @@ def on_run_calculation(working_directory_path, num_cores_slider, executable_name
                        f"{rc}</p>", output_log)
 
     except Exception as e:
-        _current_process = None
         yield f"<p style='color:red'>Error running QE: {e}</p>", None
 
 
@@ -871,7 +928,8 @@ def calculation_tab_content(working_directory_path_state, working_directory_file
             on_run_calculation,
             [working_directory_path_state, num_cores_slider, qe_executable_dropdown,
              input_file_dropdown, output_file_textbox, qe_bin_dir_textbox],
-            [status_markdown, output_log_textbox])
+            [status_markdown, output_log_textbox],
+            concurrency_id="qe_runs", concurrency_limit=1)
         # Refresh the file list once the run finishes so output files appear.
         run_event.then(refresh_file_list, working_directory_path_state, working_directory_file_list_state)
 

@@ -1,7 +1,10 @@
 """automation.py — workflow definitions, convergence sweeps, and their guards."""
 import os
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from pymatgen.io.pwscf import PWInput
 
 import automation as A
 import calculation as C
@@ -98,6 +101,27 @@ class TestConvValues:
     def test_a_backwards_range_is_rejected(self):
         with pytest.raises(Exception, match="Stop must be"):
             A._conv_values("ecutwfc", 70, 30, 10)
+
+    @pytest.mark.parametrize("param,start,stop,step", [
+        ("ecutwfc", float("nan"), 50, 1),
+        ("ecutwfc", 30, float("inf"), 1),
+        ("k-grid", 2, 8, float("nan")),
+        ("ecutwfc", 0, 50, 1),
+        ("k-grid", 0.1, 4, 1),
+        ("unknown", 2, 8, 2),
+    ])
+    def test_invalid_values_are_rejected(self, param, start, stop, step):
+        with pytest.raises(ValueError):
+            A._conv_values(param, start, stop, step)
+
+    @pytest.mark.parametrize("param,start,stop,step", [
+        ("k-grid", 2, 4, 0.1),
+        ("ecutwfc", 30, 31, 1e-8),
+    ])
+    def test_rounding_cannot_repeat_a_prefix_and_overwrite_a_scan_point(
+            self, param, start, stop, step):
+        with pytest.raises(ValueError, match="distinct convergence values"):
+            A._conv_values(param, start, stop, step)
 
 
 class TestConvergenceOutputs:
@@ -204,6 +228,44 @@ class TestOnRunWorkflow:
         # The first stage's input was still generated before the pre-flight failed.
         assert os.path.exists(os.path.join(working_dir, "scf.in"))
 
+    def test_scf_uses_the_relaxed_atomic_positions(
+            self, working_dir, structure, pseudo_root, monkeypatch):
+        relaxed = structure.copy()
+        relaxed.translate_sites([0], [0.07, 0.02, 0.01])
+        relaxed.to(filename=os.path.join(working_dir, "relax.cif"))
+        monkeypatch.setattr(C, "preflight_run", lambda *_args: ("pw.x", None))
+        monkeypatch.setattr(C, "run_qe_stream", lambda *_args: iter([("JOB DONE\n", 0)]))
+        monkeypatch.setattr(C, "write_relaxed_cif", lambda *_args: "relax.cif")
+
+        outputs = list(self.args(working_dir, workflow_type="Relax → SCF"))
+
+        assert "finished successfully" in outputs[-1][0]
+        scf = PWInput.from_file(os.path.join(working_dir, "scf.in")).structure
+        initial = PWInput.from_file(os.path.join(working_dir, "relax.in")).structure
+        assert not np.allclose(initial.frac_coords, scf.frac_coords)
+        assert scf.matches(relaxed)
+
+    def test_unreadable_relaxed_structure_stops_before_scf(
+            self, working_dir, structure_file, pseudo_root, monkeypatch):
+        monkeypatch.setattr(C, "preflight_run", lambda *_args: ("pw.x", None))
+        monkeypatch.setattr(C, "run_qe_stream", lambda *_args: iter([("relax log\n", 0)]))
+        monkeypatch.setattr(C, "write_relaxed_cif", lambda *_args: None)
+
+        outputs = list(self.args(working_dir, workflow_type="Relax → SCF"))
+
+        status, log = outputs[-1]
+        assert "color:red" in status and "relaxed structure" in status
+        assert "relax log" in log
+        assert not os.path.exists(os.path.join(working_dir, "scf.in"))
+
+    def test_validation_failure_keeps_another_runs_stop_handle(
+            self, working_dir, structure_file, monkeypatch):
+        running = object()
+        monkeypatch.setattr(C, "_current_process", running)
+        list(self.args(working_dir, functional="Custom (Libxc / input_dft)",
+                       custom_functional=""))
+        assert C._current_process is running
+
 
 class TestOnRunConvergence:
     def args(self, working_dir, **overrides):
@@ -254,3 +316,57 @@ class TestOnRunConvergence:
         list(self.args(working_dir, param="k-grid", start=2, stop=4, step=2))
         written = open(os.path.join(working_dir, "conv_k2.in")).read()
         assert "2 2 2" in written and "ecutwfc = 50" in written
+
+    def test_scan_clears_previous_output_before_starting(
+            self, working_dir, structure_file, pseudo_root):
+        _status, _log, fig, table = first(self.args(working_dir))
+        assert fig is None and table.empty
+
+    def test_completed_points_remain_visible_when_a_later_point_fails(
+            self, working_dir, structure_file, pseudo_root, monkeypatch):
+        monkeypatch.setattr(C, "preflight_run", lambda *_args: ("pw.x", None))
+        runs = iter([("first point log\n", 0), ("second point failed\n", 1)])
+        monkeypatch.setattr(C, "run_qe_stream", lambda *_args: iter([next(runs)]))
+        monkeypatch.setattr(A, "PWxml", lambda *_args: SimpleNamespace(final_energy=-100.0))
+
+        outputs = list(self.args(working_dir))
+
+        status, log, *_rest = outputs[-1]
+        assert "color:red" in status and "second point failed" in log
+        tables = [row[3] for row in outputs if hasattr(row[3], "empty") and not row[3].empty]
+        assert tables[-1]["Value"].tolist() == [30]
+        assert tables[-1]["Total energy (eV)"].tolist() == ["-100.000000"]
+
+    def test_later_exception_preserves_completed_points_and_log(
+            self, working_dir, structure_file, pseudo_root, monkeypatch):
+        def preflight(*_args):
+            if _args[2] == "conv_ecutwfc40.in":
+                raise OSError("later failure")
+            return "pw.x", None
+
+        monkeypatch.setattr(C, "preflight_run", preflight)
+        monkeypatch.setattr(C, "run_qe_stream", lambda *_args: iter([("first point log\n", 0)]))
+        monkeypatch.setattr(A, "PWxml", lambda *_args: SimpleNamespace(final_energy=-100.0))
+        running = object()
+        monkeypatch.setattr(C, "_current_process", running)
+
+        status, log, fig, table = list(self.args(working_dir))[-1]
+
+        assert "later failure" in status and "first point log" in log
+        assert fig is not None and table["Value"].tolist() == [30]
+        assert C._current_process is running
+
+    def test_unreadable_energies_are_reported_in_status_and_log(
+            self, working_dir, structure_file, pseudo_root, monkeypatch):
+        def unreadable(*_args):
+            raise ValueError("incomplete XML")
+
+        monkeypatch.setattr(C, "preflight_run", lambda *_args: ("pw.x", None))
+        monkeypatch.setattr(C, "run_qe_stream", lambda *_args: iter([("JOB DONE\n", 0)]))
+        monkeypatch.setattr(A, "PWxml", unreadable)
+
+        status, log, fig, table = list(self.args(working_dir, start=30, stop=30))[-1]
+
+        assert "color:orange" in status and "Could not read energies" in status
+        assert "incomplete XML" in log
+        assert fig is None and table["Total energy (eV)"].tolist() == ["n/a"]

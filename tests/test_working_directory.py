@@ -67,13 +67,22 @@ class TestOnOpenWorkingDirectory:
         with pytest.warns(UserWarning, match="working directory name"):
             dropdown, path, files, upload = W.on_open_working_directory(name)
         assert (path, files) == (None, None)
-        assert dropdown == gr.update() and upload == gr.update()
+        assert dropdown == gr.update() and upload == gr.update(interactive=False)
         assert not (tmp_path / "escape").exists()
         assert not data_root.exists() or list(data_root.iterdir()) == []
 
     def test_surrounding_whitespace_is_trimmed(self, data_root):
         _dropdown, path, _files, _upload = W.on_open_working_directory("  NaCl  ")
         assert path == os.path.join("./data/", "NaCl")
+
+    def test_a_file_with_the_directory_name_warns_instead_of_raising(self, data_root):
+        data_root.mkdir()
+        (data_root / "NaCl").write_text("existing file")
+        with pytest.warns(UserWarning, match="Error opening working directory"):
+            _dropdown, path, files, upload = W.on_open_working_directory("NaCl")
+        assert path is None and files is None
+        assert upload["interactive"] is False
+        assert (data_root / "NaCl").read_text() == "existing file"
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +176,28 @@ class TestOnSelectFile:
 # --------------------------------------------------------------------------- #
 
 class TestFileActions:
+    @pytest.mark.parametrize("action,args", [
+        (W.on_view_text_file, ("scf.in",)),
+        (W.on_save_text_file, ("scf.in", "new input")),
+        (W.on_delete_file, ("scf.in",)),
+    ])
+    def test_missing_working_directory_warns_instead_of_raising(self, action, args):
+        with pytest.warns(UserWarning, match="open a working directory"):
+            action(None, *args)
+
+    @pytest.mark.parametrize("action,args", [
+        (W.on_view_text_file, ()),
+        (W.on_save_text_file, ("replacement",)),
+        (W.on_delete_file, ()),
+    ])
+    def test_file_actions_cannot_escape_the_directory(self, working_dir, tmp_path,
+                                                       action, args):
+        outside = tmp_path / "outside.in"
+        outside.write_text("original")
+        with pytest.warns(UserWarning, match="select a file in the working directory"):
+            action(working_dir, str(outside), *args)
+        assert outside.read_text() == "original"
+
     def test_upload_copies_into_the_working_directory(self, working_dir, tmp_path):
         source = tmp_path / "upload.cif"
         source.write_text("data_x\n")
@@ -220,6 +251,49 @@ class TestFileActions:
         open(os.path.join(working_dir, "a.cif"), "w").close()
         with pytest.warns(UserWarning, match="select a text file"):
             assert W.on_save_text_file(working_dir, None, "text") == ["a.cif"]
+
+
+class TestTextEditor:
+    def test_selecting_another_file_does_not_change_the_save_target(self, working_dir):
+        first = os.path.join(working_dir, "first.in")
+        second = os.path.join(working_dir, "second.in")
+        with open(first, "w") as fh:
+            fh.write("first input")
+        with open(second, "w") as fh:
+            fh.write("second input")
+        _viewer, _save, target = W.on_load_text_editor(working_dir, "first.in")
+        W.on_select_file(select_event("second.in"))
+        with pytest.warns(UserWarning, match="File saved successfully"):
+            W.on_save_text_editor(working_dir, target, "edited first input")
+        assert open(first).read() == "edited first input"
+        assert open(second).read() == "second input"
+
+    def test_switching_directories_cannot_save_the_old_buffer(self, working_dir, tmp_path):
+        with open(os.path.join(working_dir, "scf.in"), "w") as fh:
+            fh.write("first input")
+        _viewer, _save, target = W.on_load_text_editor(working_dir, "scf.in")
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "scf.in").write_text("other input")
+        with pytest.warns(UserWarning, match="current working directory"):
+            W.on_save_text_editor(str(other), target, "old buffer")
+        assert (other / "scf.in").read_text() == "other input"
+
+    def test_failed_load_disables_saving_and_clears_target(self, working_dir):
+        with pytest.warns(UserWarning, match="No such file"):
+            viewer, save, target = W.on_load_text_editor(working_dir, "missing.in")
+        assert viewer["value"] == "" and viewer["interactive"] is False
+        assert save["interactive"] is False and target is None
+
+    def test_deleted_file_is_not_recreated_from_a_stale_buffer(self, working_dir):
+        path = os.path.join(working_dir, "scf.in")
+        with open(path, "w") as fh:
+            fh.write("input")
+        _viewer, _save, target = W.on_load_text_editor(working_dir, "scf.in")
+        os.remove(path)
+        with pytest.warns(UserWarning, match="no longer exists"):
+            W.on_save_text_editor(working_dir, target, "old input")
+        assert not os.path.exists(path)
 
 
 class TestOnViewStructureFile:

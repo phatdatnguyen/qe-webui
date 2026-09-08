@@ -149,6 +149,17 @@ class TestFindQeXml:
         expected = touch(out_dir, "alpha.xml")
         assert R.find_qe_xml(working_dir) == expected
 
+    def test_finds_a_custom_prefix_with_only_a_save_xml(self, working_dir, out_dir):
+        expected = touch(out_dir, "silicon.save", "data-file-schema.xml")
+        assert R.find_qe_xml(working_dir) == expected
+
+    def test_ignores_projection_xml_and_directories(self, working_dir, out_dir):
+        touch(out_dir, "atomic_proj.xml")
+        os.mkdir(os.path.join(out_dir, "directory.xml"))
+        expected = touch(out_dir, "silicon.xml")
+        assert R.find_qe_xml(working_dir) == expected
+        assert R.find_xml_choices(working_dir) == ["out/silicon.xml"]
+
     def test_nothing_found(self, working_dir):
         assert R.find_qe_xml(working_dir) is None
 
@@ -217,10 +228,15 @@ class TestParseQeOutputs:
         assert bundle["prefix"] == "pwscf"
         assert bundle["errors"] and "pwscf.xml" in bundle["errors"][0]
 
-    def test_a_selection_that_no_longer_exists_falls_back(self, working_dir, out_dir):
+    def test_a_missing_selection_does_not_load_a_different_run(self, working_dir,
+                                                              out_dir, monkeypatch):
         touch(out_dir, "pwscf.xml")
+        parsed = []
+        monkeypatch.setattr(R, "PWxml", lambda path: parsed.append(path))
         bundle = R.parse_qe_outputs(working_dir, "out/deleted.xml")
-        assert bundle["xml_path"] == os.path.join(out_dir, "pwscf.xml")
+        assert bundle["xml_path"] is None and bundle["pwxml"] is None
+        assert "out/deleted.xml" in bundle["errors"][0]
+        assert parsed == []
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +304,24 @@ class TestBandEdges:
                        kpoints=[[0, 0, 0], [0.5, 0, 0]])
         vbm, cbm, is_direct = R.band_edges(run)
         assert (vbm, cbm) == (-1.0, 2.0) and not is_direct
+
+    def test_a_degenerate_valence_edge_can_still_give_a_direct_gap(self):
+        run = spin_run(energies=[[-1.0, 3.0], [-1.0, 2.0]],
+                       occupancies=[[1, 0], [1, 0]],
+                       kpoints=[[0, 0, 0], [0.5, 0, 0]])
+        assert R.band_edges(run) == (-1.0, 2.0, True)
+
+    def test_a_degenerate_conduction_edge_can_still_give_a_direct_gap(self):
+        run = spin_run(energies=[[-2.0, 2.0], [-1.0, 2.0]],
+                       occupancies=[[1, 0], [1, 0]],
+                       kpoints=[[0, 0, 0], [0.5, 0, 0]])
+        assert R.band_edges(run) == (-1.0, 2.0, True)
+
+    def test_equivalent_reciprocal_coordinates_are_the_same_kpoint(self):
+        run = spin_run(energies=[[-1.0, 3.0], [-2.0, 2.0]],
+                       occupancies=[[1, 0], [1, 0]],
+                       kpoints=[[0, 0, 0], [1, 0, 0]])
+        assert R.band_edges(run) == (-1.0, 2.0, True)
 
     def test_smearing_tails_do_not_swallow_the_gap(self):
         """The silicon regression: conduction states carry small occupancies, so a
@@ -455,7 +489,8 @@ class TestFindBandsInput:
 class TestBandsInputFor:
     def test_accepts_the_matching_bands_run(self, working_dir, bands_input):
         path, expected = bands_input
-        bundle = bundle_for(StubRun(calculation="bands", nkpoints=expected),
+        kpoints = R._expanded_kpath(R.PWin.from_file(path).k_points)
+        bundle = bundle_for(StubRun(calculation="bands", actual_kpoints=kpoints),
                             path=working_dir)
         assert R._bands_input_for(bundle) == (path, None)
 
@@ -484,6 +519,75 @@ class TestBandsInputFor:
         _found, error = R._bands_input_for(bundle_for(StubRun(), path=working_dir),
                                            "Projected bands")
         assert error.startswith("Projected bands")
+
+
+class TestBandsInputAssociation:
+    # QE expands each segment excluding its endpoint, then adds the final vertex.
+    KPOINTS = [[0, 0, 0], [0.25, 0, 0], [0.5, 0, 0],
+               [0.5, 0.25, 0], [0.5, 0.5, 0]]
+
+    def write_input(self, working_dir, name, prefix="selected", other_path=False):
+        path = os.path.join(working_dir, name)
+        middle = "0 0.5 0" if other_path else "0.5 0 0"
+        with open(path, "w") as fh:
+            fh.write(f"&CONTROL\n calculation = 'bands'\n prefix = '{prefix}'\n/\n"
+                     f"K_POINTS crystal_b\n3\n0 0 0 2 ! G\n{middle} 2 ! X\n"
+                     "0.5 0.5 0 1 ! M\n")
+        return path
+
+    def bundle(self, working_dir, **extras):
+        args = {"calculation": "bands", "prefix": "selected",
+                "actual_kpoints": self.KPOINTS}
+        args.update(extras)
+        return bundle_for(StubRun(**args), path=working_dir, prefix="renamed_xml")
+
+    def test_expands_the_full_path_in_the_order_qe_uses(self, working_dir):
+        path = self.write_input(working_dir, "bands.in")
+        np.testing.assert_allclose(
+            R._expanded_kpath(R.PWin.from_file(path).k_points), self.KPOINTS)
+
+    def test_equal_length_paths_are_matched_by_actual_qe_prefix(self, working_dir):
+        self.write_input(working_dir, "aaa.in", prefix="other")
+        expected = self.write_input(working_dir, "selected.in")
+        assert R._bands_input_for(self.bundle(working_dir)) == (expected, None)
+
+    def test_a_matching_pwi_input_is_found_alongside_other_runs(self, working_dir):
+        self.write_input(working_dir, "aaa.in", prefix="other")
+        expected = self.write_input(working_dir, "selected.pwi")
+        assert R._bands_input_for(self.bundle(working_dir)) == (expected, None)
+
+    def test_same_prefix_and_point_count_are_matched_by_coordinates(self, working_dir):
+        self.write_input(working_dir, "aaa.in", other_path=True)
+        expected = self.write_input(working_dir, "selected.in")
+        assert R._bands_input_for(self.bundle(working_dir)) == (expected, None)
+
+    def test_duplicate_matching_inputs_are_reported_as_ambiguous(self, working_dir):
+        self.write_input(working_dir, "first.in")
+        self.write_input(working_dir, "second.in")
+        found, error = R._bands_input_for(self.bundle(working_dir))
+        assert found is None and "Several bands inputs match" in error
+        assert "first.in" in error and "second.in" in error
+
+    def test_no_matching_prefix_and_path_is_reported(self, working_dir):
+        self.write_input(working_dir, "wrong_prefix.in", prefix="other")
+        self.write_input(working_dir, "wrong_path.in", other_path=True)
+        found, error = R._bands_input_for(self.bundle(working_dir))
+        assert found is None and "No bands input matches" in error
+
+    def test_missing_kpoints_cannot_disambiguate_multiple_inputs(self, working_dir):
+        self.write_input(working_dir, "first.in")
+        self.write_input(working_dir, "second.in")
+        found, error = R._bands_input_for(self.bundle(working_dir, actual_kpoints=None))
+        assert found is None and "No bands input matches" in error
+
+    def test_one_input_still_works_when_xml_kpoint_metadata_is_unavailable(self, working_dir):
+        path = self.write_input(working_dir, "bands.in")
+        assert R._bands_input_for(self.bundle(working_dir, actual_kpoints=None)) == (path, None)
+
+    def test_a_rewritten_single_input_with_the_same_count_is_rejected(self, working_dir):
+        self.write_input(working_dir, "bands.in", other_path=True)
+        found, error = R._bands_input_for(self.bundle(working_dir))
+        assert found is None and "does not match" in error
 
 
 class TestPlotsWithoutData:
@@ -651,6 +755,48 @@ class TestOnCompareRuns:
         assert table["Run"].tolist() == ["pwscf"]
         assert table["Energy (eV)"].tolist() == ["unreadable"]
         assert figure is None and "Compared 1 run(s)" in message
+
+    def test_bad_dos_preserves_one_valid_summary_row(self, working_dir, monkeypatch):
+        run = TestBuildSummaryDataframe().full_run()
+        monkeypatch.setattr(R, "parse_qe_outputs", lambda *args: bundle_for(run))
+        touch(working_dir, "pwscf.dos")
+
+        def unreadable_dos(*args, **kwargs):
+            raise ValueError("truncated DOS file")
+
+        monkeypatch.setattr(R, "PWxml", unreadable_dos)
+        table, figure, message = R.on_compare_runs(working_dir, ["out/pwscf.xml"])
+        assert table["Run"].tolist() == ["pwscf"]
+        assert table["Energy (eV)"].tolist() == ["-1234.500000"]
+        assert figure is None and "truncated DOS file" in message
+
+    def test_dos_plot_failure_preserves_the_table(self, working_dir, monkeypatch):
+        run = TestBuildSummaryDataframe().full_run()
+        monkeypatch.setattr(R, "parse_qe_outputs", lambda *args: bundle_for(run))
+        monkeypatch.setattr(R, "PWxml", lambda *args, **kwargs: StubRun(tdos=object()))
+        monkeypatch.setattr(R.DosPlotter, "add_dos", lambda *args: None)
+        touch(working_dir, "pwscf.dos")
+
+        def broken_plot(*args, **kwargs):
+            raise ValueError("invalid DOS grid")
+
+        monkeypatch.setattr(R.DosPlotter, "get_plot", broken_plot)
+        table, figure, message = R.on_compare_runs(working_dir, ["out/pwscf.xml"])
+        assert len(table) == 1 and figure is None
+        assert "invalid DOS grid" in message
+        assert "overlaid total DOS" not in message
+
+    def test_save_xmls_use_the_run_prefix_as_the_label(self, working_dir, monkeypatch):
+        monkeypatch.setattr(R, "parse_qe_outputs", lambda *args: bundle_for(None))
+        table, _figure, _message = R.on_compare_runs(working_dir, [
+            "out/silicon.save/data-file-schema.xml", "out/nacl.save/data-file-schema.xml"])
+        assert table["Run"].tolist() == ["silicon", "nacl"]
+
+    def test_duplicate_prefixes_have_distinct_labels(self, working_dir, monkeypatch):
+        monkeypatch.setattr(R, "parse_qe_outputs", lambda *args: bundle_for(None))
+        selections = ["first/silicon.xml", "second/silicon.xml"]
+        table, _figure, _message = R.on_compare_runs(working_dir, selections)
+        assert table["Run"].tolist() == selections
 
 
 class TestExports:

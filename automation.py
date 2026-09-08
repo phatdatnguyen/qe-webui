@@ -1,4 +1,5 @@
 import os
+import math
 import warnings
 import pandas as pd
 import matplotlib
@@ -54,6 +55,7 @@ def on_file_list_change_structures(wf_current, cv_current, working_directory_fil
 def on_run_workflow(working_directory_path, workflow_type, structure_file, pseudo_set,
                     ecutwfc, ecutrho, kx, ky, kz, functional, custom_functional,
                     output_name, num_cores, qe_bin_dir):
+    full_log = ""
     try:
         if not working_directory_path:
             yield "<p style='color:red'>No working directory is open.</p>", ""
@@ -66,6 +68,7 @@ def on_run_workflow(working_directory_path, workflow_type, structure_file, pseud
             yield f"<p style='color:red'>{err}</p>", ""
             return
         prefix = output_name.strip()
+        C.validate_qe_prefix(prefix)
 
         stages = WORKFLOWS.get(workflow_type)
         if not stages:
@@ -80,7 +83,6 @@ def on_run_workflow(working_directory_path, workflow_type, structure_file, pseud
         if any(calc_type == "bands" for calc_type, _exe in stages):
             C.ensure_bands_cell(structure)
 
-        full_log = ""
         n = len(stages)
         for i, (calc_type, exe_name) in enumerate(stages, 1):
             input_name = C.default_input_name(calc_type)
@@ -118,15 +120,19 @@ def on_run_workflow(working_directory_path, workflow_type, structure_file, pseud
             # overwrites this stage's XML.
             if calc_type in C.RELAX_TYPES:
                 cif = C.write_relaxed_cif(working_directory_path, input_name, out_name)
-                if cif:
-                    full_log += f"\n[Saved relaxed structure: {cif}]\n"
+                if not cif:
+                    raise ValueError("Could not read the relaxed structure; workflow stopped "
+                                     "before generating the next stage.")
+                # A shared prefix carries electronic data, but atomic positions
+                # still come from the next input file. Use the relaxed geometry.
+                structure = Structure.from_file(os.path.join(working_directory_path, cif))
+                full_log += f"\n[Saved relaxed structure: {cif}]\n"
 
         yield (f"<p style='color:green'>Workflow '{workflow_type}' finished successfully "
                f"({n} stages, prefix '{prefix}').</p>", full_log)
 
     except Exception as e:
-        C._current_process = None
-        yield f"<p style='color:red'>Workflow error: {e}</p>", None
+        yield f"<p style='color:red'>Workflow error: {e}</p>", full_log
 
 
 # --------------------------------------------------------------------------- #
@@ -135,18 +141,30 @@ def on_run_workflow(working_directory_path, workflow_type, structure_file, pseud
 
 def _conv_values(param, start, stop, step):
     """Build the list of parameter values to scan (inclusive of stop, capped)."""
+    if param not in {"ecutwfc", "k-grid"}:
+        raise ValueError(f"Unknown convergence parameter: {param!r}.")
     start, stop, step = float(start), float(stop), float(step)
+    if not all(math.isfinite(v) for v in (start, stop, step)):
+        raise ValueError("Start, stop, and step must be finite numbers.")
     if step <= 0:
         raise Exception("Step must be greater than 0.")
     if stop < start:
         raise Exception("Stop must be ≥ start.")
+    if start <= 0:
+        raise ValueError("Start must be greater than 0.")
     values, v = [], start
     while v <= stop + 1e-9 and len(values) < MAX_CONV_POINTS:
         if param == "k-grid":
-            values.append(int(round(v)))
+            value = int(round(v))
         else:
             fv = round(v, 6)
-            values.append(int(fv) if float(fv).is_integer() else fv)  # 30.0 -> 30
+            value = int(fv) if float(fv).is_integer() else fv  # 30.0 -> 30
+        if value <= 0:
+            raise ValueError("Convergence values must be greater than 0 after rounding.")
+        if values and value == values[-1]:
+            raise ValueError("Step is too small to produce distinct convergence values "
+                             "after rounding. Increase the step.")
+        values.append(value)
         v += step
     return values
 
@@ -155,6 +173,8 @@ def on_run_convergence(working_directory_path, structure_file, pseudo_set, ecutw
                        kx, ky, kz, functional, custom_functional, output_name,
                        num_cores, qe_bin_dir, param, start, stop, step):
     empty_df = pd.DataFrame(columns=["Value", "Total energy (eV)", "ΔE vs previous (eV)"])
+    full_log, results = "", []
+    fig, df = None, empty_df
     try:
         if not working_directory_path:
             yield "<p style='color:red'>No working directory is open.</p>", "", None, empty_df
@@ -167,6 +187,7 @@ def on_run_convergence(working_directory_path, structure_file, pseudo_set, ecutw
             yield f"<p style='color:red'>{err}</p>", "", None, empty_df
             return
         base_prefix = output_name.strip()
+        C.validate_qe_prefix(base_prefix)
 
         values = _conv_values(param, start, stop, step)
         if not values:
@@ -181,7 +202,6 @@ def on_run_convergence(working_directory_path, structure_file, pseudo_set, ecutw
         if ratio < 4.0:
             warn = " <span style='color:orange'>(note: ecutrho/ecutwfc &lt; 4)</span>"
 
-        full_log, results = "", []
         n = len(values)
         tag_param = "k" if param == "k-grid" else param
         for i, v in enumerate(values, 1):
@@ -196,7 +216,7 @@ def on_run_convergence(working_directory_path, structure_file, pseudo_set, ecutw
                 this_ecutwfc, this_ecutrho, kgrid = ecutwfc, ecutrho, (v, v, v)
 
             full_log += f"\n===== [{i}/{n}] {param} = {v} =====\n"
-            yield (f"<p>Convergence: {param} = {v} [{i}/{n}]...{warn}</p>", full_log, gr.update(), gr.update())
+            yield (f"<p>Convergence: {param} = {v} [{i}/{n}]...{warn}</p>", full_log, fig, df)
 
             C.generate_pw_input_file(
                 working_directory_path, "scf", structure, pseudo_set,
@@ -225,17 +245,23 @@ def on_run_convergence(working_directory_path, structure_file, pseudo_set, ecutw
                     warnings.simplefilter("ignore")
                     energy = PWxml(os.path.join(working_directory_path, OUT_SUBDIR,
                                                 f"{run_prefix}.xml")).final_energy
-            except Exception:
+            except Exception as e:
                 energy = None
+                full_log += f"\n[Could not read energy for {run_prefix}: {e}]\n"
             results.append((v, energy))
+            fig, df = _convergence_outputs(param, results)
+            # Publish each finished point so Stop or a later failure keeps the
+            # completed part of the scan visible.
+            yield (f"<p>Convergence: completed {i}/{n} points.{warn}</p>", full_log, fig, df)
 
-        fig, df = _convergence_outputs(param, results)
-        yield (f"<p style='color:green'>Convergence scan finished ({n} points).{warn}</p>",
+        missing = sum(energy is None for _value, energy in results)
+        color = "orange" if missing else "green"
+        note = f" Could not read energies for {missing} point(s); see the log." if missing else ""
+        yield (f"<p style='color:{color}'>Convergence scan finished ({n} points).{note}{warn}</p>",
                full_log, fig, df)
 
     except Exception as e:
-        C._current_process = None
-        yield f"<p style='color:red'>Convergence error: {e}</p>", "", None, empty_df
+        yield f"<p style='color:red'>Convergence error: {e}</p>", full_log, fig, df
 
 
 def _convergence_outputs(param, results):
@@ -259,6 +285,7 @@ def _convergence_outputs(param, results):
     ax.set_ylabel("Total energy (eV)")
     ax.set_title("Convergence of total energy")
     fig.tight_layout()
+    plt.close(fig)
     return fig, df
 
 
@@ -352,7 +379,7 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
         [working_directory_path_state, wf_type, wf_structure, wf_pseudo_set,
          wf_ecutwfc, wf_ecutrho, wf_kx, wf_ky, wf_kz, wf_functional, wf_custom_functional,
          wf_output_name, wf_cores, wf_bin_dir],
-        [status_markdown, wf_log])
+        [status_markdown, wf_log], concurrency_id="qe_runs", concurrency_limit=1)
     wf_event.then(C.refresh_file_list, working_directory_path_state, working_directory_file_list_state)
     wf_stop_event = wf_stop_button.click(C.on_stop_calculation, None, status_markdown, cancels=[wf_event])
     wf_stop_event.then(C.refresh_file_list, working_directory_path_state, working_directory_file_list_state)
@@ -362,7 +389,7 @@ def automation_tab_content(working_directory_path_state, working_directory_file_
         [working_directory_path_state, cv_structure, cv_pseudo_set, cv_ecutwfc, cv_ecutrho,
          cv_kx, cv_ky, cv_kz, cv_functional, cv_custom_functional, cv_output_name,
          cv_cores, cv_bin_dir, cv_param, cv_start, cv_stop, cv_step],
-        [status_markdown, cv_log, cv_plot, cv_table])
+        [status_markdown, cv_log, cv_plot, cv_table], concurrency_id="qe_runs", concurrency_limit=1)
     cv_event.then(C.refresh_file_list, working_directory_path_state, working_directory_file_list_state)
     cv_stop_event = cv_stop_button.click(C.on_stop_calculation, None, status_markdown, cancels=[cv_event])
     cv_stop_event.then(C.refresh_file_list, working_directory_path_state, working_directory_file_list_state)
